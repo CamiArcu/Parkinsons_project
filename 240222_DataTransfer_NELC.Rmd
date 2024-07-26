@@ -1,0 +1,911 @@
+---
+title: "Data Transfer NE-LC"
+author: "Camila Arcuschin; Ignacio Schor"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    theme: cerulean
+    code_folding: hide
+out.width: '30%'
+out.heigh: '100%'
+fig.width: '100%'
+fig.height: '100%'
+dpi: 100
+editor_options: 
+  markdown: 
+    wrap: 72
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, echo = TRUE, warning = FALSE, cache=F, dev = c('png', 'pdf'))
+knitr::opts_knit$set(root.dir = "/data_husihuilke/shared/SMB/carcu/Parkinsons_project/")
+```
+
+```{r, include=FALSE}
+library(Seurat)
+library(SeuratDisk)
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library(cowplot)
+library(future)
+#register(MulticoreParam(10))
+plan(multisession, workers = 6)
+# plan("multiprocess", workers = 6)
+options(future.globals.maxSize = 4000 * 1024^2)
+options(ggrepel.max.overlaps = Inf)
+```
+
+plotear tmb los clusters en la transferencia al UMAP de query, probar tambien hacer un rpca para el transfer label y  plotear tambien los grupos de pagoda cuando lo hago sin glia
+
+```{r}
+CellType_colors <- c("GABA/Glut.ergic" = "#d11141","GABAergic" = "#f37735",  "Glutamatergic_Slc17a6" = "#00b159", "Glutamatergic_Slc17a7" = "#AACC00", "NEergic" = "#00aedb", "Slc17a6/Barrington?" = "#B56576")
+colors_n <- readRDS("Outputs/231129_QC_first_part_tidy_cluster_colors_LC.rds")
+#colors_n <- colors_n[as.character(c(0:14))[-13]]
+
+my_theme <- theme_void(base_size = 6) + theme(title = element_text(face = "bold"))
+```
+
+
+## RNA(after-integration)-RNA-LogNormalize-PCAproject (reference projects into the query)
+
+Import integrated data and reference data
+
+```{r}
+SeuInt <- readRDS("Outputs/231129_SeuInt_3rd4th_fil_int_mayt1000lowt60000_lowtInfrb_24clusters.rds")
+
+SeuInt <- subset(SeuInt, subset = Treat == "Ctrl")
+#SeuInt <- subset(SeuInt, subset = Treat == "Ctrl", idents = c(0,1,6,7,9,10,11,13,14))
+
+SeuRef <-readRDS("/data_husihuilke/shared/SMB/carcu/Caramia_2023/data/231018_SeuratProject_integrated_allLC.rds")
+DimPlot(SeuRef, cols = CellType_colors)
+DefaultAssay(SeuRef) <- "RNA"
+SeuRef <- NormalizeData(SeuRef,
+                normalization.method = "LogNormalize",
+                scale.factor = 10000) %>%
+  FindVariableFeatures(
+    selection.method = "vst",
+    nfeatures = 2000,
+    loess.span = 0.6
+  )
+SeuRef <- ScaleData(SeuRef) %>%
+  RunPCA(npcs = 30, reduction.name = "pca.RNA")
+
+```
+
+After finding anchors, we use the TransferData() function to classify the query cells based on reference data (a vector of reference cell type labels). TransferData() returns a matrix with predicted IDs and prediction scores, which we can add to the query metadata.
+
+```{r}
+anchors <- FindTransferAnchors(
+  reference = SeuRef,
+  reference.assay = "RNA",
+  query = SeuInt,
+  query.assay = "RNA",
+  dims = 1:30,
+  reference.reduction = "pca.RNA",
+  normalization.method = "LogNormalize"
+)
+predictions <- TransferData(anchorset = anchors,
+                            refdata = SeuRef$CellType,
+                            dims = 1:30)
+SeuInt <- AddMetaData(SeuInt, metadata = predictions)
+```
+
+```{r}
+DefaultAssay(SeuInt) <- "INTE"
+a <- DimPlot(SeuInt, label = T, cols = colors_n) + theme(legend.position = "none")
+b <- DimPlot(SeuInt, group.by = "predicted.id", label = T, cols = CellType_colors, order = F) + theme(legend.position = "none")
+a + b
+
+library(ggrepel)
+
+DefaultAssay(SeuRef) <- "integrated"
+SeuRef <-  RunUMAP(
+    SeuRef,
+    dims = 1:30,
+    reduction = "pca",
+    return.model = TRUE
+  )
+SeuIntq <-  MapQuery(
+    anchorset = anchors,
+    reference = SeuRef,
+    query = SeuInt,
+    refdata = list(celltype = "CellType"),
+    reference.reduction = "pca.RNA", #"pca.RNA"
+    reduction.model = "umap"
+  )
+p1 <-  DimPlot(
+    SeuRef,
+    reduction = "umap",
+    group.by = "CellType",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = CellType_colors,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+p2 <-  DimPlot(
+    SeuIntq,
+    reduction = "ref.umap",
+    group.by = "predicted.id",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = CellType_colors,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Query transferred labels") 
+p3 <-  DimPlot(
+    SeuIntq,
+    reduction = "ref.umap",
+    group.by = "seurat_clusters",
+    label = T,
+    label.size = 3,
+    repel = TRUE,
+    cols = colors_n,
+    pt.size = 0.3,
+    order = F,
+    shuffle = T
+  ) + my_theme + ggtitle("Clusters") + theme(legend.position = "none")
+p6 <-  DimPlot(
+    SeuRef,
+    reduction = "umap",
+    group.by = "seurat_clusters",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F,
+    shuffle = T
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+plot_grid(p1, p2, p3, p6, ncol = 3, nrow = 2)
+```
+
+## RNA(but pca after-integration)-RNA-LogNormalize-RPCA (one projects into the other and viceversa for the query RNA, that is why I choose it)
+
+
+```{r}
+anchors <- FindTransferAnchors(
+  reference = SeuRef,
+  reference.assay = "RNA",
+  reduction = "rpca",
+  reference.reduction = "pca", #Even in reciprocal PCA: # pcaproject is used as the weight.matrix in MapQuery
+  query = SeuInt,
+  query.assay = "RNA",
+  dims = 1:30,
+  normalization.method = "LogNormalize"
+)
+predictions <- TransferData(anchorset = anchors,
+                            refdata = SeuRef$CellType,
+                            dims = 1:30)
+saveRDS(predictions, "Outputs/240222_DataTransfer_NELC_predictions_ctrl.rds")
+SeuInt <- AddMetaData(SeuInt, metadata = predictions)
+```
+
+```{r}
+DefaultAssay(SeuInt) <- "INTE"
+a <- DimPlot(SeuInt, label = T, cols = colors_n) + theme(legend.position = "none")
+b <- DimPlot(SeuInt, group.by = "predicted.id", label = F, cols = CellType_colors, order = F) + theme(legend.position = "none")
+a + b
+
+DefaultAssay(SeuRef) <- "integrated"
+SeuRef <-  RunUMAP(
+    SeuRef,
+    dims = 1:30,
+    reduction = "pca",
+    return.model = TRUE
+  )
+SeuIntq <-  MapQuery(
+    anchorset = anchors,
+    reference = SeuRef,
+    query = SeuInt,
+    refdata = list(celltype = "CellType"),
+    # By default: slot(object = anchors, name = "command")$reference #rpca.ref.l2. #Even in reciprocal PCA: # pcaproject is used as the weight.matrix in MapQuery.
+    # So it only use the anchors of the RPCA but using the projection of the query on the reference to plot the query. 
+    reduction.model = "umap"
+  )
+# all(SeuIntq$predicted.celltype.score == SeuInt$prediction.score.max) # T
+
+p1 <-  DimPlot(
+    SeuRef,
+    reduction = "umap",
+    group.by = "CellType",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = CellType_colors,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+p2 <-  DimPlot(
+    SeuIntq,
+    reduction = "ref.umap",
+    group.by = "predicted.id",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = CellType_colors,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Query transferred labels") 
+p3 <-  DimPlot(
+    SeuIntq,
+    reduction = "ref.umap",
+    group.by = "seurat_clusters",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = colors_n,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Clusters") 
+p6 <-  DimPlot(
+    SeuRef,
+    reduction = "umap",
+    group.by = "seurat_clusters",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+plot_grid(p1, p2, p3, p6, ncol = 3, nrow = 2)
+
+saveRDS(SeuInt, "Outputs/231024_SeuInt_clean_clusters_neurons_cell_annotation.rds")
+```
+
+
+## integrated-INTE.SCT(first-normalized-then-integrated)-SCT normalization-Recompute residuals
+
+```{r}
+SeuInt_o <- readRDS("Outputs/231129_SeuInt_3rd4th_fil_int_mayt1000lowt60000_lowtInfrb_24clusters.rds")
+SeuInt_o <- subset(SeuInt_o, subset = Treat == "Ctrl")
+#SeuInt_o <- subset(SeuInt_o, subset = Treat == "Ctrl", idents = c(0,1,6,7,9,10,11,13,14))
+
+SeuInt <- SeuInt_o
+SeuInt_list <- SplitObject(SeuInt, split.by = "orig.ident")
+for (i in 1:length(SeuInt_list)) {
+  SeuInt_list[[i]] <-
+    SCTransform(
+      SeuInt_list[[i]],
+      assay = "RNA",
+      return.only.var.genes = FALSE,
+      verbose = FALSE,
+      variable.features.n = 10000
+    )
+  SeuInt_list[[i]] <-
+    RunPCA(SeuInt_list[[i]], npcs = 30, reduction.name = "pca.SCT")
+}
+Int.features <-
+  SelectIntegrationFeatures(object.list = SeuInt_list, nfeatures = 10000)
+SeuInt_list <-
+  PrepSCTIntegration(object.list = SeuInt_list, anchor.features = Int.features)
+Int.anchors <-
+  FindIntegrationAnchors(
+    object.list = SeuInt_list,
+    anchor.features = Int.features,
+    normalization.method = "SCT"
+  )
+SeuInt <-
+  IntegrateData(
+    anchorset = Int.anchors,
+    normalization.method = "SCT",
+    new.assay.name = "INTE.SCT"
+  )
+DefaultAssay(SeuInt) <- "INTE.SCT"
+SeuInt <- RunPCA(SeuInt, npcs = 30, verbose = FALSE)
+
+SeuRef <-
+  readRDS("/data_husihuilke/shared/SMB/carcu/Caramia_2023/data/231018_SeuratProject_integrated_allLC.rds")
+DefaultAssay(SeuRef) <- "integrated"
+rm(SeuInt_list)
+gc()
+```
+
+```{r}
+anchors <- FindTransferAnchors(
+    reference = SeuRef,
+    reference.assay = "integrated",
+    query = SeuInt,
+    query.assay = "INTE.SCT",
+    dims = 1:30,
+    normalization.method = "SCT",
+    reference.reduction = "pca"
+  )
+predictions <- TransferData(anchorset = anchors,
+               refdata = SeuRef$CellType,
+               dims = 1:30)
+SeuInt <- AddMetaData(SeuInt, metadata = predictions)
+```
+
+```{r}
+DefaultAssay(SeuInt) <- "INTE"
+SeuInt@reductions$umap <- SeuInt_o@reductions$umap
+a <- DimPlot(SeuInt, label = T, cols = colors_n, order = F) + theme(legend.position = "none")
+b <- DimPlot(SeuInt, group.by = "predicted.id", label = T, cols = CellType_colors, order = F) + theme(legend.position = "none")
+a + b
+
+DefaultAssay(SeuRef) <- "integrated"
+SeuRef <-  RunUMAP(
+    SeuRef,
+    dims = 1:30,
+    reduction = "pca",
+    return.model = TRUE
+  )
+DimPlot(SeuRef, cols = CellType_colors)
+SeuIntq <-  MapQuery(
+    anchorset = anchors,
+    reference = SeuRef,
+    query = SeuInt,
+    refdata = list(celltype = "CellType"),
+    reference.reduction = "pca",
+    reduction.model = "umap"
+  )
+
+p1 <-  DimPlot(
+    SeuRef,
+    reduction = "umap",
+    group.by = "CellType",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = CellType_colors,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+p2 <-  DimPlot(
+    SeuIntq,
+    reduction = "ref.umap",
+    group.by = "predicted.id",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = CellType_colors,
+    pt.size = 0.3,
+    order = F
+   ) + my_theme + theme(legend.position = "none") + ggtitle("Query transferred labels")
+p3 <-  DimPlot(
+    SeuIntq,
+    reduction = "ref.umap",
+    group.by = "seurat_clusters",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = colors_n,
+    pt.size = 0.3,
+    order = F
+   ) + my_theme + theme(legend.position = "none") + ggtitle("Clusters")
+p6 <-  DimPlot(
+    SeuRef,
+    reduction = "umap",
+    group.by = "seurat_clusters",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+plot_grid(p1, p2, p3, p6, ncol = 3, nrow = 2)
+```
+
+
+## integrated-INTE.SCT(first-normalized-then-integrated)-SCT Normalization- without Recompute residuals
+
+
+
+```{r}
+anchors <- FindTransferAnchors(
+    reference = SeuRef,
+    reference.assay = "integrated",
+    query = SeuInt,
+    query.assay = "INTE.SCT",
+    recompute.residuals = F,
+    dims = 1:30,
+    normalization.method = "SCT",
+    reference.reduction = "pca"
+  )
+predictions <- TransferData(anchorset = anchors,
+               refdata = SeuRef$CellType,
+               dims = 1:30)
+SeuInt <- AddMetaData(SeuInt, metadata = predictions)
+```
+
+```{r}
+DefaultAssay(SeuInt) <- "INTE"
+SeuInt@reductions$umap <- SeuInt_o@reductions$umap
+a <- DimPlot(SeuInt, label = T, cols = colors_n, order = F) + theme(legend.position = "none")
+b <- DimPlot(SeuInt, group.by = "predicted.id", label = T, cols = CellType_colors, order = F) + theme(legend.position = "none")
+a + b
+
+DefaultAssay(SeuRef) <- "integrated"
+SeuRef <-  RunUMAP(
+    SeuRef,
+    dims = 1:30,
+    reduction = "pca",
+    return.model = TRUE
+  )
+DimPlot(SeuRef, cols = CellType_colors)
+SeuIntq <-  MapQuery(
+    anchorset = anchors,
+    reference = SeuRef,
+    query = SeuInt,
+    refdata = list(celltype = "CellType"),
+    reference.reduction = "pca",
+    reduction.model = "umap"
+  )
+
+p1 <-  DimPlot(
+    SeuRef,
+    reduction = "umap",
+    group.by = "CellType",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = CellType_colors,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+p2 <-  DimPlot(
+    SeuIntq,
+    reduction = "ref.umap",
+    group.by = "predicted.id",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = CellType_colors,
+    pt.size = 0.3,
+    order = F
+   ) + my_theme + theme(legend.position = "none") + ggtitle("Query transferred labels")
+p3 <-  DimPlot(
+    SeuIntq,
+    reduction = "ref.umap",
+    group.by = "seurat_clusters",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = colors_n,
+    pt.size = 0.3,
+    order = F
+   ) + my_theme + theme(legend.position = "none") + ggtitle("Clusters")
+p6 <-  DimPlot(
+    SeuRef,
+    reduction = "umap",
+    group.by = "seurat_clusters",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+plot_grid(p1, p2, p3, p6, ncol = 3, nrow = 2)
+```
+
+## INTE(LogNormalize-then-integrate)-INTE-LogNormalize
+
+```{r}
+SeuInt <- readRDS("Outputs/231129_SeuInt_3rd4th_fil_int_mayt1000lowt60000_lowtInfrb_24clusters.rds")
+SeuInt <- subset(SeuInt, subset = Treat == "Ctrl")
+#SeuInt <- subset(SeuInt, subset = Treat == "Ctrl", idents = c(0,1,6,7,9,10,11,13,14))
+DefaultAssay(SeuInt) <- "INTE"
+
+SeuRef <- readRDS("/data_husihuilke/shared/SMB/carcu/Caramia_2023/data/231018_SeuratProject_integrated_allLC.rds")
+DefaultAssay(SeuRef) <- "RNA"
+SeuRef_list <- SplitObject(SeuRef, split.by = "id")
+for (i in 1:length(SeuRef_list)) {
+  DefaultAssay(SeuRef_list[[i]]) <- "RNA"
+  SeuRef_list[[i]] <-  NormalizeData(SeuRef_list[[i]],
+                  normalization.method = "LogNormalize",
+                  scale.factor = 10000) %>%
+    FindVariableFeatures(
+      selection.method = "vst",
+      nfeatures = 2000,
+      loess.span = 0.6
+    )
+  SeuRef_list[[i]] <- ScaleData(SeuRef_list[[i]]) %>%
+    RunPCA(npcs = 30)
+}
+SeuRefFeatures <- SelectIntegrationFeatures(SeuRef_list)
+Ref.anchors <- FindIntegrationAnchors(
+    SeuRef_list,
+    reduction = "cca",
+    dims = 1:30,
+    anchor.features = SeuRefFeatures,
+    scale = F,
+    normalization.method = c("LogNormalize")
+  )
+# LCmark <-
+#   c("Dbh",
+#     "Th",
+#     "Slc6a2",
+#     "Chrna7",
+#     "Maoa",
+#     "Rlim",
+#     "Sec23a",
+#     "Ppp2r2d",
+#     "Usp34")
+# Neuron <- c("Rbfox3") # General neurons
+# Ex <- c("Slc17a6", "Slc17a7") # Excitatory neurons
+# Inh <- c("Gad1") # Inhibitory neuron
+SeuRef <-  IntegrateData(
+  anchorset = Ref.anchors,
+  dims = 1:30,
+  new.assay.name = "INTE",
+  features.to.integrate = c(
+    SeuRefFeatures
+    # LCmark,
+    # Neuron,
+    # Ex,
+    # Inh
+  )
+)
+SeuRef <- ScaleData(SeuRef, npcs = 30, verbose = FALSE)
+SeuRef <- RunPCA(SeuRef, npcs = 30, verbose = FALSE)
+SeuRef <-
+  RunUMAP(
+    SeuRef,
+    reduction = "pca",
+    dims = 1:30,
+    return.model = TRUE
+  )
+DefaultAssay(SeuRef) <- "INTE"
+rm(SeuRef_list)
+gc()
+```
+
+```{r}
+anchors <-  FindTransferAnchors(
+    reference = SeuRef,
+    reference.assay = "INTE",
+    query = SeuInt,
+    query.assay = "INTE",
+    dims = 1:30,
+    normalization.method = "LogNormalize",
+    reference.reduction = "pca",
+    recompute.residuals = F
+  )
+predictions <- TransferData(anchorset = anchors,
+               refdata = SeuRef$CellType,
+               dims = 1:30)
+SeuInt <- AddMetaData(SeuInt, metadata = predictions)
+```
+
+```{r}
+DefaultAssay(SeuInt) <- "INTE"
+a <- DimPlot(SeuInt, label = T, cols = colors_n, order = F) + theme(legend.position = "none")
+b <- DimPlot(SeuInt, group.by = "predicted.id", label = T, cols = CellType_colors, order = F) + theme(legend.position = "none")
+a + b
+
+DefaultAssay(SeuRef) <- "INTE"
+#SeuRef <- RunUMAP(SeuRef, dims = 1:30, reduction = "pca", return.model = TRUE)
+DimPlot(SeuRef, cols = CellType_colors)
+SeuIntq <-  MapQuery(
+    anchorset = anchors,
+    reference = SeuRef,
+    query = SeuInt,
+    refdata = list(celltype = "CellType"),
+    reference.reduction = "pca",
+    reduction.model = "umap"
+  )
+
+p1 <-  DimPlot(
+    SeuRef,
+    reduction = "umap",
+    group.by = "CellType",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = CellType_colors,
+    pt.size = 0.3,
+    order = F
+   ) + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+p2 <-  DimPlot(
+    SeuIntq,
+    reduction = "ref.umap",
+    group.by = "predicted.id",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = CellType_colors,
+    pt.size = 0.3,
+    order = F
+   ) + my_theme + theme(legend.position = "none") + ggtitle("Query transferred labels")
+p3 <-  DimPlot(
+    SeuIntq,
+    reduction = "ref.umap",
+    group.by = "seurat_clusters",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = colors_n,
+    pt.size = 0.3,
+    order = F
+   ) + my_theme + theme(legend.position = "none") + ggtitle("Clusters")
+p6 <-  DimPlot(
+    SeuRef,
+    reduction = "umap",
+    group.by = "seurat_clusters",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F
+   ) + my_theme + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+plot_grid(p1, p2, p3, p6, ncol = 3, nrow = 2)
+```
+
+## INTE-INTE-LogNormalize-RenormalizingBothBeforeIntegrate
+
+```{r}
+SeuInt_o <- readRDS("Outputs/231129_SeuInt_3rd4th_fil_int_mayt1000lowt60000_lowtInfrb_24clusters.rds")
+SeuInt_o <- subset(SeuInt_o, subset = Treat == "Ctrl")
+#SeuInt_o <- subset(SeuInt_o, subset = Treat == "Ctrl", idents = c(0,1,6,7,9,10,11,13,14))
+
+SeuInt <- SeuInt_o
+DefaultAssay(SeuInt) <- "RNA"
+SeuInt_list <- SplitObject(SeuInt, split.by = "orig.ident")
+for (i in 1:length(SeuInt_list)) {
+  DefaultAssay(SeuInt_list[[i]]) <- "RNA"
+  SeuInt_list[[i]] <-  NormalizeData(SeuInt_list[[i]],
+                  normalization.method = "LogNormalize",
+                  scale.factor = 10000) %>%
+    FindVariableFeatures(
+      selection.method = "vst",
+      nfeatures = 2000,
+      loess.span = 0.6
+    )
+  SeuInt_list[[i]] <- ScaleData(SeuInt_list[[i]]) %>%
+    RunPCA(npcs = 30)
+}
+obj_dims = 30
+SeuIntFeatures <- SelectIntegrationFeatures(SeuInt_list) 
+anchors <- FindIntegrationAnchors(SeuInt_list, reduction = "rpca", reference = 1,  dims = 1:obj_dims, anchor.features = SeuIntFeatures, scale = F, k.anchor = 10, k.filter = 100,  k.score = 20, max.features = 100) 
+LCmark <- c("Dbh", "Th", "Slc6a2","Chrna7", "Maoa", "Rlim", "Sec23a", "Ppp2r2d", "Usp34") 
+Neuron <- c("Rbfox3") 
+Ex <- c("Slc17a6", "Slc17a7") 
+Inh <- c("Gad1") 
+Astrocytes <- c("Gfap", "Gja1") 
+Microglia <- c("C1qb") 
+OPC <- c("Olig1", "Tnr")
+Oligodendrocyte <- c("Tfrc", "Plp1", "Mbp") 
+Fibro <- c("Dcn") 
+Capil <- c("Flt1", "Rgs5")
+markers <- c("EGFP-KASH", "hSNCA-A53T", "mCherry",  "Snca")
+SeuInt <- IntegrateData(anchorset = anchors, dims = 1:obj_dims, k.weight = 20, new.assay.name = "INTE", features.to.integrate = c(SeuIntFeatures, LCmark, Neuron, Ex, Inh, Fibro, Astrocytes, Microglia, Oligodendrocyte, OPC, Capil, markers))
+DefaultAssay(SeuInt) <- "INTE"
+rm(SeuInt_list)
+gc()
+
+
+SeuRef <- readRDS("/data_husihuilke/shared/SMB/carcu/Caramia_2023/data/231018_SeuratProject_integrated_allLC.rds")
+DefaultAssay(SeuRef) <- "RNA"
+SeuRef_list <- SplitObject(SeuRef, split.by = "id")
+for (i in 1:length(SeuRef_list)) {
+  DefaultAssay(SeuRef_list[[i]]) <- "RNA"
+  SeuRef_list[[i]] <-  NormalizeData(SeuRef_list[[i]],
+                  normalization.method = "LogNormalize",
+                  scale.factor = 10000) %>%
+    FindVariableFeatures(
+      selection.method = "vst",
+      nfeatures = 2000,
+      loess.span = 0.6
+    )
+  SeuRef_list[[i]] <- ScaleData(SeuRef_list[[i]]) %>%
+    RunPCA(npcs = 30)
+}
+SeuRefFeatures <- SelectIntegrationFeatures(SeuRef_list)
+Ref.anchors <- FindIntegrationAnchors(
+    SeuRef_list,
+    reduction = "cca",
+    dims = 1:30,
+    anchor.features = SeuRefFeatures,
+    scale = F,
+    normalization.method = c("LogNormalize")
+  )
+SeuRef <-  IntegrateData(
+  anchorset = Ref.anchors,
+  dims = 1:30,
+  new.assay.name = "INTE",
+  features.to.integrate = c(
+    SeuRefFeatures
+    # LCmark,
+    # Neuron,
+    # Ex,
+    # Inh
+  )
+)
+SeuRef <- ScaleData(SeuRef, npcs = 30, verbose = FALSE)
+SeuRef <- RunPCA(SeuRef, npcs = 30, verbose = FALSE)
+SeuRef <-
+  RunUMAP(
+    SeuRef,
+    reduction = "pca",
+    dims = 1:30,
+    return.model = TRUE
+  )
+DefaultAssay(SeuRef) <- "INTE"
+rm(SeuRef_list)
+gc()
+```
+
+```{r}
+anchors <-  FindTransferAnchors(
+    reference = SeuRef,
+    reference.assay = "INTE",
+    query = SeuInt,
+    query.assay = "INTE",
+    dims = 1:30,
+    normalization.method = "LogNormalize",
+    reference.reduction = "pca",
+    recompute.residuals = F
+  )
+predictions <- TransferData(anchorset = anchors,
+               refdata = SeuRef$CellType,
+               dims = 1:30)
+SeuInt <- AddMetaData(SeuInt, metadata = predictions)
+```
+
+```{r}
+DefaultAssay(SeuInt) <- "INTE"
+SeuInt@reductions$umap <- SeuInt_o@reductions$umap
+a <- DimPlot(SeuInt, label = T, cols = colors_n, order = F) + theme(legend.position = "none")
+b <- DimPlot(SeuInt, group.by = "predicted.id", label = T, cols = CellType_colors, order = F) + theme(legend.position = "none")
+a + b
+
+DefaultAssay(SeuRef) <- "INTE"
+#SeuRef <- RunUMAP(SeuRef, dims = 1:30, reduction = "pca", return.model = TRUE)
+DimPlot(SeuRef, cols = CellType_colors)
+SeuIntq <-  MapQuery(
+    anchorset = anchors,
+    reference = SeuRef,
+    query = SeuInt,
+    refdata = list(celltype = "CellType"),
+    reference.reduction = "pca",
+    reduction.model = "umap"
+  )
+
+p1 <-  DimPlot(
+    SeuRef,
+    reduction = "umap",
+    group.by = "CellType",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = CellType_colors,
+    pt.size = 0.3,
+    order = F
+   ) + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+p2 <-  DimPlot(
+    SeuIntq,
+    reduction = "ref.umap",
+    group.by = "predicted.id",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = CellType_colors,
+    pt.size = 0.3,
+    order = F
+   ) + my_theme + theme(legend.position = "none") + ggtitle("Query transferred labels")
+p3 <-  DimPlot(
+    SeuIntq,
+    reduction = "ref.umap",
+    group.by = "seurat_clusters",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = colors_n,
+    pt.size = 0.3,
+    order = F
+   ) + my_theme + theme(legend.position = "none") + ggtitle("Clusters")
+p6 <-  DimPlot(
+    SeuRef,
+    reduction = "umap",
+    group.by = "seurat_clusters",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+plot_grid(p1, p2, p3, p6, ncol = 3, nrow = 2)
+```
+
+## INTE-RNA-SCT-RecomputeResiduals
+
+Equivalent to run 'SCTransform()' on the query data (integrate-then-SCTransform) but using the reference data for the 'reference.SCT.model'parameter. Also 'recompute.residuals' is always true by default when normalization method is "SCT".
+
+```{r}
+SeuInt <- readRDS("Outputs/231129_SeuInt_3rd4th_fil_int_mayt1000lowt60000_lowtInfrb_24clusters.rds")
+SeuInt <- subset(SeuInt, subset = Treat == "Ctrl")
+#SeuInt <- subset(SeuInt_o, subset = Treat == "Ctrl", idents = c(0,1,6,7,9,10,11,13,14))
+DefaultAssay(SeuInt) <- "RNA"
+
+SeuInt <- FindVariableFeatures(SeuInt, nfeatures = 10000)
+
+SeuRef <- readRDS("/data_husihuilke/shared/SMB/carcu/Caramia_2023/data/231018_SeuratProject_integrated_allLC.rds")
+DefaultAssay(SeuRef) <- "integrated"
+```
+
+```{r}
+anchors <-  FindTransferAnchors(
+    reference = SeuRef,
+    reference.assay = "integrated",
+    query = SeuInt,
+    query.assay = "RNA",
+    dims = 1:30,
+    features = VariableFeatures(SeuInt)[VariableFeatures(SeuInt) %in% VariableFeatures(SeuRef)],
+    normalization.method = "SCT",
+    reference.reduction = "pca",
+    recompute.residuals = T
+  )
+predictions <- TransferData(anchorset = anchors,
+               refdata = SeuRef$CellType,
+               dims = 1:30)
+SeuInt <- AddMetaData(SeuInt, metadata = predictions)
+```
+
+```{r}
+DefaultAssay(SeuInt) <- "INTE"
+a <- DimPlot(SeuInt, label = T, cols = colors_n, order = F) + theme(legend.position = "none")
+b <- DimPlot(SeuInt, group.by = "predicted.id", label = T, cols = CellType_colors, order = F) + theme(legend.position = "none")
+a + b
+
+DefaultAssay(SeuRef) <- "integrated"
+SeuRef <- RunUMAP(SeuRef, dims = 1:30, reduction = "pca", return.model = TRUE)
+DimPlot(SeuRef, cols = CellType_colors)
+SeuIntq <-  MapQuery(
+    anchorset = anchors,
+    reference = SeuRef,
+    query = SeuInt,
+    refdata = list(celltype = "CellType"),
+    reference.reduction = "pca",
+    reduction.model = "umap"
+  )
+
+p1 <-  DimPlot(
+    SeuRef,
+    reduction = "umap",
+    group.by = "CellType",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = CellType_colors,
+    pt.size = 0.3,
+    order = F
+   ) + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+p2 <-  DimPlot(
+    SeuIntq,
+    reduction = "ref.umap",
+    group.by = "predicted.id",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = CellType_colors,
+    pt.size = 0.3,
+    order = F
+   ) + my_theme + theme(legend.position = "none") + ggtitle("Query transferred labels")
+p3 <-  DimPlot(
+    SeuIntq,
+    reduction = "ref.umap",
+    group.by = "seurat_clusters",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    cols = colors_n,
+    pt.size = 0.3,
+    order = F
+   ) + my_theme + theme(legend.position = "none") + ggtitle("Clusters")
+p6 <-  DimPlot(
+    SeuRef,
+    reduction = "umap",
+    group.by = "seurat_clusters",
+    label = TRUE,
+    label.size = 3,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+plot_grid(p1, p2, p3, p6, ncol = 3, nrow = 2)
+```

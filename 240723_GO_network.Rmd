@@ -1,0 +1,96 @@
+---
+ttitle: "GO over SN and LC genes"
+author: "Camila Arcuschin; Ignacio Schor"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    theme: cerulean
+    code_folding: hide
+    out.width: 6
+    out.heigh: 6
+    fig.width: 6
+    fig.height: 6
+editor_options: 
+  markdown: 
+  wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, echo = TRUE, warning = FALSE, dpi = 500) #dev = c('pdf', 'png') # If I want to export plots but don't look to the html (because it is too heavy). Remember to also add: clean = FALSE, as a parameter of the rmarkdown::render() function, when executing 
+knitr::opts_knit$set(root.dir = "/data_husihuilke/shared/SMB/carcu/Parkinsons_project/")
+```
+
+```{r}
+library(tidyverse)
+library(org.Mm.eg.db)
+library(clusterProfiler)
+# library(ReactomePA)
+library(enrichplot)
+# library(biomaRt)
+# library(DOSE)
+# library(AnnotationHub)
+```
+
+
+```{r}
+# Plot all terms from differentially enriched
+enrichPlot <- function(x, n, title = NULL, cutoff) {
+  p <- x %>% 
+    mutate(OddsRatio = (as.numeric(sub("/.*", "", x$GeneRatio)) / as.numeric(sub(".*/", "", x$GeneRatio))) / 
+             (as.numeric(sub("/.*", "", x$BgRatio)) / as.numeric(sub(".*/", "", x$BgRatio))),
+           FDR = p.adjust,
+           Description = factor(Description, levels = Description[order(-log10(FDR))])) %>% 
+    filter(FDR <= cutoff)
+  p <-head(p, n) %>% 
+    ggplot() +
+    geom_point(aes(x = -log10(FDR), y = Description,
+                   color = -log10(FDR), size = Count)) +
+    labs(x = "-log10(FDR)", y = "", color = expression(-log[10]~"adjusted p-value"), size = "gene count", title = title) +
+    theme_linedraw() +
+    theme(panel.grid = element_blank()) +
+    scale_color_continuous(high = "#132B43", low = "#56B1F7")
+  return(p)
+}
+
+date = 240723
+
+regulon_SN_terms <- read_csv("Outputs/GRNdb_mouse_sc_whole_Brain-regulons_hyperrestricted_allupdown_hyperrstricted_session_edited_updown_regulators.csv")
+regulon_selected <- filter(regulon_SN_terms, selected == T)
+
+Uni <- regulon_SN_terms$`shared name` %>% unique()
+
+regulon_selected_notDE <- filter(regulon_selected, (gene_class_allupdown == "none" | is.na(gene_class_allupdown)))
+
+Enrich1stDS_Clusti_up <- enrichGO(regulon_selected_notDE$`shared name`,  pvalueCutoff = 1, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", minGSSize = 5, universe = Uni) 
+if (!(is.null(Enrich1stDS_Clusti_up))) {
+  if (nrow(Enrich1stDS_Clusti_up@result) > 0){
+  write_csv(Enrich1stDS_Clusti_up@result, paste0("Outputs/", date, "_GO_ORA_SN_updown_regulators.csv"))
+  enrichPlot(Enrich1stDS_Clusti_up@result, 20, paste0("GO: SN updown regulators "), cutoff = 0.05)
+  ggsave(paste0("Outputs/", date, "_GO_ORA_SN_updown_regulators.png"), width = 15, height = 10)
+  }
+}
+
+Enrich1stDS_Clusti_up <- enrichGO(regulon_selected$`shared name`,  pvalueCutoff = 1, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", minGSSize = 5, universe = Uni) 
+if (!(is.null(Enrich1stDS_Clusti_up))) {
+  if (nrow(Enrich1stDS_Clusti_up@result) > 0){
+  write_csv(Enrich1stDS_Clusti_up@result, paste0("Outputs/", date, "_GO_ORA_SN_updown_regulators_and_targets.csv"))
+  enrichPlot(Enrich1stDS_Clusti_up@result, 20, paste0("GO: SN updown regulators and targets"), cutoff = 0.05)
+  ggsave(paste0("Outputs/", date, "_GO_ORA_SN_updown_regulators_and_targets.png"), width = 15, height = 10)
+  }
+}
+
+Mouse_sc_whole_brain <- read_tsv("Data/Networks/GRNdb_mouse_sc_whole_Brain-regulons.txt")
+Uni <- c(Mouse_sc_whole_brain$TF, Mouse_sc_whole_brain$gene) %>%  unique()
+
+Enrich1stDS_Clusti_up <- enrichGO(regulon_selected$`shared name`,  pvalueCutoff = 1, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", minGSSize = 5, universe = Uni) 
+if (!(is.null(Enrich1stDS_Clusti_up))) {
+  if (nrow(Enrich1stDS_Clusti_up@result) > 0){
+  write_csv(Enrich1stDS_Clusti_up@result, paste0("Outputs/", date, "_GO_ORA_SN_updown_regulators_and_targets_UniwholeGRN.csv"))
+  enrichPlot(Enrich1stDS_Clusti_up@result, 20, paste0("GO: SN updown regulators and targets Uni whole GRN"), cutoff = 0.05)
+  ggsave(paste0("Outputs/", date, "_GO_ORA_SN_updown_regulators_and_targets_UniwholeGRN.png"), width = 15, height = 10)
+  }
+}
+
+
+```

@@ -1,0 +1,322 @@
+---
+title: "SoupX to correct data with ambient reads"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: cerulean
+    code_folding: hide
+    toc: true
+editor_options: 
+  markdown: 
+    wrap: 72
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, echo = TRUE, warning = FALSE)
+knitr::opts_knit$set(root.dir = "/data_husihuilke/shared/SMB/carcu/Parkinsons_project/")
+```
+
+Pre and Post cell contamination fraction:
+
+```{r}
+library(SoupX)
+library(readr)
+library(magrittr)
+library(Seurat)
+library(ggplot2)
+library(cowplot)
+
+# Log Normalize Seurat and select the 2000 most variable genes
+norm_seurat <- function(all_samples) {
+  all_samples <-
+    NormalizeData(all_samples,
+                  normalization.method = "LogNormalize",
+                  scale.factor = 10000)
+  all_samples <-
+    FindVariableFeatures(
+      all_samples,
+      selection.method = "vst",
+      nfeatures = 2000,
+      loess.span = 0.6
+    )
+}
+
+my_theme <- theme(legend.position = "bottom", legend.direction='horizontal', legend.box = "vertical", legend.justification = c(1,1), legend.box.just = "right")
+```
+
+```{r}
+rawfilefolder<- "230601/SCC0117_Briese_SNc_custom/outs/raw_feature_bc_matrix/"
+filename <- "231122_SeuInt_1st_fil_int_mayt1000lowt60000_lowtInfrb_SN"
+```
+
+
+```{r}
+## Load Data
+print("loading data") # Load the data and convert it into a Seurat Object
+#Load data and estimate soup profile
+
+tod = Seurat::Read10X(paste0('Data/', rawfilefolder))
+tod <- tod$`Gene Expression`
+rownames(tod) <- gsub("_", "-", rownames(tod))
+
+data <- readRDS(paste0("Outputs/", filename, ".rds"))
+DefaultAssay(data) <- "RNA"
+data <- subset(data, cells = names(na.omit(data$seurat_clusters)))
+data_mat <- GetAssayData(data, slot = "counts")
+data_mat <- data_mat[rownames(tod), ]
+#toc = Seurat::Read10X('Data/230601/SCC0117_Briese_SNc_custom/outs/filtered_feature_bc_matrix/')
+#toc <- toc$`Gene Expression`
+
+sc = SoupChannel(tod,data_mat)
+# sc = SoupChannel(tod,toc)
+
+# cluster_labels <- read_csv('Data/230601/SCC0117_Briese_SNc_custom/outs/analysis/clustering/gene_expression_kmeans_10_clusters/clusters.csv')
+# cluster_labels_vec <- as.character(cluster_labels$Cluster)
+# names(cluster_labels_vec) <- cluster_labels$Barcode
+cluster_labels_vec <- data$seurat_clusters
+names(cluster_labels_vec) <- colnames(data)
+
+sc = setClusters(sc,cluster_labels_vec)
+sc = autoEstCont(sc)
+out = adjustCounts(sc)
+```
+Genes which are high in background
+
+```{r topSoupGenes}
+head(sc$soupProfile[order(sc$soupProfile$est,decreasing=TRUE),],n=20)
+```
+
+```{r inferNonExpressed}
+plotMarkerDistribution(sc)
+```
+The plot shows the distribution of log10 ratios of observed counts to expected if the cell contained nothing but soup.  A guess at which cells definitely express each gene is made and the background contamination is calculated.  The red line shows the global estimate (i.e., assuming the same contamination fraction for all cells) of the contamination fraction using just that gene.
+
+The fisrt 10 genes that has been zeroed their counts, and the proprotion of zeroed from original matrix (closer to 1 means cntStrained is closer to zero, so more zero)
+
+```{r mostZeroed}
+cntSoggy = rowSums(sc$toc>0)
+cntStrained = rowSums(out>0)
+mostZeroed = tail(sort((cntSoggy-cntStrained)/cntSoggy),n=20)
+mostZeroed
+```
+Ptgds, mt-Co1/2/3, mt-Atp6, mt-Cytb, Gm34342/32511/26688 and Faiml are the genes who has their expression strongly corrected (Is this very conservative as the vignette explains? It doesn't seems so). Others are partiality corrected.
+
+Focusing on quantitative difference, no only on zeroed (closer to 1 means the gene has been corrected in mostly all of the cells):
+
+```{r mostReduced}
+# total genes
+nrow(sc$toc) #31231
+# How many genes are over 0 (change at least in one cell)
+which((rowSums(sc$toc>out)/rowSums(sc$toc>0)) > 0) %>% length() #20414 (65% of total)
+# How many genes are over 1 (change in all cell)
+which((rowSums(sc$toc>out)/rowSums(sc$toc>0)) == 1) %>% length() ##20414 (all of them)
+apply(sc$toc-out, 1,  function(x) mean(x[x>0])) %>% hist(breaks = 100, xlab = "mean differences") #peak on approx 0.1
+apply(sc$toc-out, 1,  function(x) log2(max(x[x>0]))) %>% hist(breaks = 100, xlab = "log10(max differences)") #peak on approx 10^(-0.2) = 0.6. Osea que no cambia tanto, es media count menos. Aunque la matrix es sparced y quizas tener o no tener 1 count no es tanto. 
+```
+Adding processed information:
+
+```{r add_DR}
+RD <- data@reductions$umap[[]] %>% as.data.frame()
+
+RD$seurat_clusters <-  data@meta.data$seurat_clusters
+
+sc = setDR(sc, RD[colnames(sc$toc), ])
+
+GeneNormExp <- GetAssayData(data, slot = "data")
+
+```
+
+Plotting Gene Clusters
+```{r}
+mids = aggregate(cbind(UMAP_1,UMAP_2) ~ seurat_clusters,data=RD,FUN=mean)
+gg = ggplot(RD,aes(UMAP_1,UMAP_2)) + 
+  geom_point(aes(colour=seurat_clusters),size=0.2) +
+  geom_label(data=mids,aes(label=seurat_clusters)) +
+  ggtitle('seurat_clusters') +
+  guides(colour = guide_legend(override.aes = list(size=1)))
+plot(gg)
+```
+
+
+Right side plot looks at the fraction of expression in each cell that has been deemed to be soup and removed
+
+```{r, include=FALSE}
+dd = RD[colnames(sc$toc),]
+dd$Nrxn1 = GeneNormExp['Nrxn1',]
+gg = ggplot(dd,aes(UMAP_1,UMAP_2)) +
+  geom_point(aes(colour=Nrxn1))
+gg2 = plotMarkerMap(sc,'Nrxn1')
+gg3 = plotChangeMap(sc,out,'Nrxn1')
+```
+
+
+```{r, fig.width= 12}
+plot_grid(gg + my_theme, gg2 + my_theme, gg3 + my_theme, nrow = 1) 
+```
+
+```{r, include=FALSE}
+dd$Gm34342 = GeneNormExp['Gm34342',]
+gg = ggplot(dd,aes(UMAP_1,UMAP_2)) +
+  geom_point(aes(colour=Gm34342))
+gg2 = plotMarkerMap(sc,'Gm34342')
+gg3 = plotChangeMap(sc,out,'Gm34342')
+```
+
+
+```{r, fig.width= 12}
+plot_grid(gg + my_theme, gg2 + my_theme, gg3 + my_theme, nrow = 1)  
+```
+
+```{r, include=FALSE}
+dd$`mt-Co3` = GeneNormExp['mt-Co3',]
+gg = ggplot(dd,aes(UMAP_1,UMAP_2)) +
+  geom_point(aes(colour=`mt-Co3`))
+gg2 = plotMarkerMap(sc,'mt-Co3')
+gg3 = plotChangeMap(sc,out,'mt-Co3')
+```
+
+```{r, fig.width= 12}
+plot_grid(gg + my_theme, gg2 + my_theme, gg3 + my_theme, nrow = 1)  
+```
+
+How much differ mt-Co3 after correction from original in 1 and 0 cluster
+```{r}
+(sc$toc-out)["mt-Co3", rownames(RD)[RD$seurat_clusters %in% c("0", "1")]] %>% as.vector() %>% hist(breaks = 100)
+```
+And now the expression of mt-Co3 is:
+```{r}
+out["mt-Co3", rownames(RD)[RD$seurat_clusters %in% c("0", "1")]] %>% as.vector() %>% hist(breaks = 100)
+```
+
+How much differ mt-Co3 after correction from original in 2 cluster
+```{r}
+(sc$toc-out)["mt-Co3", rownames(RD)[RD$seurat_clusters %in% c("2")]] %>% as.vector() %>% hist(breaks = 100)
+```
+And now the expression of mt-Co3 is:
+```{r}
+out["mt-Co3", rownames(RD)[RD$seurat_clusters %in% c("2")]] %>% as.vector() %>% hist(breaks = 100)
+```
+
+```{r, include=FALSE}
+dd$Ptgds = GeneNormExp['Ptgds',]
+gg = ggplot(dd,aes(UMAP_1,UMAP_2)) +
+  geom_point(aes(colour=Ptgds))
+gg2 = plotMarkerMap(sc,'Ptgds')
+gg3 = plotChangeMap(sc,out,'Ptgds')
+```
+
+
+```{r, fig.width= 12}
+plot_grid(gg + my_theme, gg2 + my_theme, gg3 + my_theme, nrow = 1)  
+```
+
+```{r, include=FALSE}
+dd$Gad1 = GeneNormExp['Gad1',]
+gg = ggplot(dd,aes(UMAP_1,UMAP_2)) +
+  geom_point(aes(colour=Gad1))
+gg2 = plotMarkerMap(sc,'Gad1')
+gg3 = plotChangeMap(sc,out,'Gad1')
+```
+
+
+```{r, fig.width= 12}
+plot_grid(gg + my_theme, gg2 + my_theme, gg3 + my_theme, nrow = 1) 
+```
+
+```{r, include=FALSE}
+dd$Apoe = GeneNormExp['Apoe',]
+gg = ggplot(dd,aes(UMAP_1,UMAP_2)) +
+  geom_point(aes(colour=Apoe))
+gg2 = plotMarkerMap(sc,'Apoe')
+gg3 = plotChangeMap(sc,out,'Apoe')
+```
+
+
+```{r, fig.width= 12}
+plot_grid(gg + my_theme, gg2 + my_theme, gg3 + my_theme, nrow = 1) 
+```
+
+
+```{r, include=FALSE}
+dd$Dach1 = GeneNormExp['Dach1',]
+gg = ggplot(dd,aes(UMAP_1,UMAP_2)) +
+  geom_point(aes(colour=Dach1))
+gg2 = plotMarkerMap(sc,'Dach1')
+gg3 = plotChangeMap(sc,out,'Dach1')
+```
+
+
+```{r, fig.width = 12}
+plot_grid(gg + my_theme, gg2 + my_theme, gg3 + my_theme, nrow = 1) 
+```
+
+```{r, include=FALSE}
+dd$Malat1 <- GeneNormExp["Malat1",]
+gg = ggplot(dd,aes(UMAP_1,UMAP_2)) +
+  geom_point(aes(colour=Malat1))
+gg2 = plotMarkerMap(sc,'Malat1')
+gg3 = plotChangeMap(sc,out,'Malat1')
+```
+
+
+```{r, fig.width= 12}
+plot_grid(gg + my_theme, gg2 + my_theme, gg3 + my_theme, nrow = 1) 
+```
+
+```{r, include=FALSE}
+dd$Nrgn <- GeneNormExp["Nrgn",]
+gg = ggplot(dd,aes(UMAP_1,UMAP_2)) +
+  geom_point(aes(colour=Nrgn))
+gg2 = plotMarkerMap(sc,'Nrgn')
+gg3 = plotChangeMap(sc,out,'Nrgn')
+```
+
+
+```{r, fig.width= 12}
+plot_grid(gg + my_theme, gg2 + my_theme, gg3 + my_theme, nrow = 1) 
+```
+
+```{r}
+SeuInt <- CreateSeuratObject(out) 
+SeuInt <- norm_seurat(SeuInt)
+SeuInt@meta.data <- data@meta.data
+saveRDS(SeuInt, paste0("Outputs/", filename, "_SoupXOut.rds"))
+```
+
+
+```{r}
+## compare with PBMC data
+tmpDir = tempdir(check=TRUE)
+download.file('https://cf.10xgenomics.com/samples/cell-exp/2.1.0/pbmc4k/pbmc4k_raw_gene_bc_matrices.tar.gz',destfile=file.path(tmpDir,'tod.tar.gz'))
+download.file('https://cf.10xgenomics.com/samples/cell-exp/2.1.0/pbmc4k/pbmc4k_filtered_gene_bc_matrices.tar.gz',destfile=file.path(tmpDir,'toc.tar.gz'))
+untar(file.path(tmpDir,'tod.tar.gz'),exdir=tmpDir)
+untar(file.path(tmpDir,'toc.tar.gz'),exdir=tmpDir)
+toc = Seurat::Read10X(file.path(tmpDir,'filtered_gene_bc_matrices','GRCh38'))
+tod = Seurat::Read10X(file.path(tmpDir,'raw_gene_bc_matrices','GRCh38'))
+sc = SoupChannel(tod,toc)
+data(PBMC_metaData)
+rownames(PBMC_metaData) <- paste0(rownames(PBMC_metaData), "-1")
+sc = setClusters(sc,setNames(PBMC_metaData$Cluster,rownames(PBMC_metaData)))
+sc = autoEstCont(sc)
+sc = setDR(sc,PBMC_metaData[colnames(sc$toc),c('RD1','RD2')])
+dd = PBMC_metaData[colnames(sc$toc),]
+mids = aggregate(cbind(RD1,RD2) ~ Annotation,data=dd,FUN=mean)
+gg = ggplot(dd,aes(RD1,RD2)) + 
+  geom_point(aes(colour=Annotation),size=0.2) +
+  geom_label(data=mids,aes(label=Annotation)) +
+  ggtitle('PBMC 4k Annotation') +
+  guides(colour = guide_legend(override.aes = list(size=1)))
+plot(gg)
+dd$IGKC = sc$toc['IGKC',]
+gg = ggplot(dd,aes(RD1,RD2)) +
+  geom_point(aes(colour=IGKC>0))
+plot(gg)
+gg = plotMarkerMap(sc,'IGKC')
+plot(gg)
+```
+
+Looking at the resulting plot, we see that the cells in the B-cell cluster have a reddish colour, indicating that they are expressed far more than we would expect by chance, even if the cell was nothing but background.  Our paradigm changing, antibody producing T-cells do not fare so well.  They all have a decidedly bluish hue, indicating that is completely plausible that the expression of _IGKC_ in these cells is due to contamination from the soup.  Those cells that are shown as dots have zero expression for _IGKC_.
+
+
+

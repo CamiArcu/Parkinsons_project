@@ -1,0 +1,198 @@
+---
+title: "Differential expression analysis Big Clusters"
+author: "Camila Arcuschin; Ignacio Schor"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    theme: cerulean
+    code_folding: hide
+params:
+    args: ''
+out.width: '30%'
+out.heigh: '100%'
+fig.width: '100%'
+fig.height: '100%'
+dpi: 100
+editor_options: 
+  markdown: 
+    wrap: 72
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, echo = TRUE, warning = FALSE)
+knitr::opts_knit$set(root.dir = "/data_husihuilke/shared/SMB/carcu/Parkinsons_project/")
+```
+
+```{r, include=FALSE}
+library(Seurat)
+library(tidyverse)
+library(DESeq2)
+library(zinbwave)
+library(scran)
+library(RhpcBLASctl)
+library(ggrepel)
+library(BiocParallel)
+library(DT)
+register(MulticoreParam(10))
+```
+
+```{r, include=FALSE}
+#### Functions
+FCfun <- function (res_DE, fc, pad){
+  res_DE$diffexpressed <- "NO"
+  res_DE$diffexpressed[res_DE$log2FC > fc & res_DE$padj <= pad] <- "UP"
+  res_DE$diffexpressed[res_DE$log2FC < -fc & res_DE$padj <= pad] <- "DOWN"
+  res_DE$delabel <- NA
+  res_DE$delabel[res_DE$diffexpressed != "NO"] <- res_DE$Gene[res_DE$diffexpressed != "NO"]
+  res_DE$delabel[res_DE$Gene == "hSNCA-A53T"] <- "hSNCA-A53T"
+
+  Volcano<-ggplot(data=res_DE , aes(x=log2FC, y=-log10(padj), col=diffexpressed, label=delabel)) +
+    geom_point() +
+    theme_minimal() +
+    #xlim(min, max) +
+    geom_text_repel(max.overlaps = 100) +
+    scale_color_manual(values=c("DOWN" = "blue", "NO" = "black", "UP" = "red")) +
+    geom_vline(xintercept=c(-fc, fc), col="red") +
+    geom_hline(yintercept=-log10(pad), col="red")
+  Volcano
+}
+
+## Exclude unwellcomed genes from labeling, in the effect measure
+FCfun2 <- function (res_DE, fc, pad, notWellcome){
+  res_DE$diffexpressed <- "NO"
+  res_DE$diffexpressed[res_DE$log2FC > fc & res_DE$padj <= pad] <- "UP"
+  res_DE$diffexpressed[res_DE$log2FC < -fc & res_DE$padj <= pad] <- "DOWN"
+  res_DE$delabel <- NA
+  res_DE$delabel[res_DE$diffexpressed != "NO"] <- res_DE$Gene[res_DE$diffexpressed != "NO"]
+  res_DE$delabel[res_DE$Gene %in% notWellcome] <- NA
+  
+  Volcano<-ggplot(data=res_DE, aes(x=log2FC, y=-log10(padj), col=diffexpressed, label=delabel, alpha = !(Gene %in% notWellcome))) +
+    geom_point() +
+    theme_minimal() +
+    #xlim(min, max) +
+    geom_text_repel(max.overlaps = 100) + 
+    scale_color_manual(values=c("DOWN" = "blue", "NO" = "black", "UP" = "red")) +
+    geom_vline(xintercept=c(-fc, fc), col="red") +
+    geom_hline(yintercept=-log10(pad), col="red")
+  Volcano
+}
+```
+
+## Subseted data for post-hoc analysis of the jmo
+
+Differentially expressed genes (padj <= 0.05) from the analysis of the jmo, clust 3, were used to check differences in the medias only across treatment (no interaction with DS evaluated).
+
+
+## DE Analysis
+
+[The model:]{.underline}
+
+For DE Analysis, we are doing an nbinomLRT. This means that we are doing
+a Likelihood Ratio Test of a full vs. a reduced model that both of them
+fit the data to a negative binomial model.
+
+In this context, the full model is:
+$$Counts  ⁓   Treat$$
+And the reduced model is: $$Counts  ⁓  1$$
+
+
+Same control of droupouts method was used as before (analysis from the 230626), also this counts for parameters used to estimate dispersion
+
+
+```{r CoreAnalysis, message=FALSE}
+#args =  commandArgs(trailingOnly=TRUE)
+m = args[1] 
+j = args[2]
+file = args[3]
+date = args[4]
+
+  #SeuObj <- readRDS("Outputs/231024_SeuInt_1st_fil_int_mayt1000lowt60000_lowtInfrb_SN.rds")
+  SeuObj <- readRDS(paste0("Outputs/", file))
+  DefaultAssay(SeuObj) <- "RNA"
+  SeuObj <- SetAssayData(SeuObj, assay.type = "RNA", slot = "counts", new.data = round(GetAssayData(SeuObj, slot = "counts"), 0))
+  #GetAssayData(object = SeuObj, slot = "counts")
+  SeuObj@meta.data <- select(SeuObj@meta.data, seurat_clusters, Treat, Age)
+  genenames <- rownames(SeuObj[["RNA"]]) 
+  SceLC <- subset(SeuObj, subset = seurat_clusters == m & Age == j)
+  SceLC <- DietSeurat(SceLC)
+  SceLC <- as.SingleCellExperiment(SceLC)
+  Average_Counts <- rowMeans(assays(SceLC)[["counts"]]) %>% log10()
+  ExpressingCells <- rowSums(assays(SceLC)[["counts"]]>0)
+  PropExpressingCells <- ExpressingCells/dim(SceLC)[2]
+  gPEC_Avg <- data.frame(Genes = rownames(SceLC), AvgCounts = Average_Counts, PEC = PropExpressingCells)
+  write_tsv(gPEC_Avg, paste0("Outputs/", date, "_Gene_PropExpressingCells_AvgCounts_clust", m, "_", j, "_SN.tsv"))
+  Average_Counts["hSNCA-A53T"] 
+  PropExpressingCells["hSNCA-A53T"]
+  if (Average_Counts["hSNCA-A53T"] > -1 & PropExpressingCells["hSNCA-A53T"] > 0.1){
+    SceLC <- SceLC[Average_Counts > -1 & PropExpressingCells > 0.1, ]
+    rownames(SceLC) <- genenames[Average_Counts > -1 & PropExpressingCells > 0.1]
+  } else {
+    SceLC <- rbind(SceLC[Average_Counts > -1 & PropExpressingCells > 0.1, ], SceLC["hSNCA-A53T",])
+    rownames(SceLC) <- c(genenames[Average_Counts > -1 & PropExpressingCells > 0.1], "hSNCA-A53T")
+  }
+  rm(.Random.seed)
+  set.seed(0)
+  rm(SeuObj)
+  colData(SceLC)$Treat <- factor(x = colData(SceLC)$Treat)
+  colData(SceLC)$Age <- factor(x = colData(SceLC)$Age)
+  blas_set_num_threads(1)
+  assay(SceLC) <- as.matrix(assay(SceLC))
+  SceLC <- scran::convertTo(SceLC, type = "DESeq2")
+  weights <- computeObservationalWeights(zinbFit(SceLC, X="~Treat", commondispersion = TRUE, epsilon=1e12), counts(SceLC))
+  assays(SceLC,  withDimnames = FALSE)[["weights"]] <- weights
+  SceLC <- scran::computeSumFactors(SceLC)#, clusters = clusters) # Compute sizeFactors for each cell avoiding biases because of dropouts (using deconvolution method by scran).
+  design(SceLC) <- formula(~Treat)
+  SceLC <- DESeq2::estimateDispersions(object = SceLC, fitType='local') # fitType "local" because the algorithm couldn't find parameters a and b to fit a function between mean and variance (and that is because is preatty plain the relationship)
+  SceLC <- nbinomLRT(SceLC, reduced= ~1, minmu = 1e-6)
+```
+
+#### log2FC of PD/Ctrl in jmo 3rd:
+
+```{r}
+eff_PD_jmo_3rd <- DESeq2::results(object = SceLC, contrast = list(c("Treat_PD_vs_Ctrl")), alpha = 0.05, independentFiltering=F, cooksCutoff=F ) %>% data.frame() %>% mutate(Gene = rownames(.))
+PD <- coef(SceLC)[,c("Intercept", "Treat_PD_vs_Ctrl" )] %>%   rowSums()
+  Ctrl <- coef(SceLC)[,c("Intercept")]
+  log2FC <- log2(2^(PD)/2^(Ctrl))
+  FC_df <- data.frame(log2FC, Gene = rownames(coef(SceLC)))
+  FC_df_jmo_1st <- inner_join(eff_PD_jmo_3rd, FC_df)
+  GeneLab <- if_else(FC_df_jmo_1st$Gene == "hSNCA-A53T", "hSNCA-A53T", "NA")
+  GeneLab[GeneLab == "NA"] <- NA
+  FC_df_jmo_1st$GeneLab <- GeneLab
+```
+
+
+## Volcano plots
+
+#### Threshold in padj-value = 0.05:
+
+```{r}
+    FC_df_jmo_1st %>% FCfun(0.5, 0.05) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 1st DS")
+```
+
+If I use a lower log2FC threshold:
+
+```{r}
+    FC_df_jmo_1st  %>% FCfun(0.3, 0.05) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 1st DS")
+```
+
+```{r}
+DT::datatable(FC_df_jmo_1st, filter = "top")
+```
+
+
+```{r}
+# Saving these table
+write_csv(FC_df_jmo_1st, paste0("Outputs/", date, "_FCmat_clust", m, "_", j, "_SN.csv"))
+```
+
+The top 50 genes (by padj) are:
+
+```{r}
+filter(FC_df_jmo_1st, padj <= 0.05) %>% arrange(padj) %>% DT::datatable(filter = "top")
+```
+
+

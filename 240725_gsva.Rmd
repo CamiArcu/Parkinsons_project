@@ -1,0 +1,572 @@
+---
+title: "GSVA"
+author: "Camila Arcuschin; Ignacio Schor"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: cerulean
+    code_folding: hide
+    bibliography: references.bib
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, message = FALSE, warning = FALSE, dpi=500)
+knitr::opts_knit$set(root.dir = "/data_husihuilke/shared/SMB/carcu/Parkinsons_project/")
+```
+
+```{r}
+library(tidyverse)
+library(GSVA)
+library(gplots)
+library(ggcorrplot)
+library(GSA)
+library(scales)
+library(cowplot)
+library(ggplot2)
+library(ggplotify)
+```
+
+```{r Functions}
+GeneSetCor <- function(cor.matrix){
+  ggcorrplot(cor.matrix, hc.order = F, 
+           type = "full", 
+           lab = TRUE, 
+           lab_size = 3, title="Correlation of Expression", 
+           ggtheme=theme_bw,
+           show.diag = T)+scale_fill_gradient2(low="darkblue", high="red", mid = "white", midpoint=0.5)}
+
+# Legend of the heatmap
+get_legend<-function(myggplot){
+  tmp <- ggplot_gtable(ggplot_build(myggplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)
+}
+
+# Legend of the heatmap
+get_plot<-function(myggplot){
+  tmp <- ggplot_gtable(ggplot_build(myggplot))
+  plot <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[plot]]
+  return(legend)
+}
+
+# Data preparation
+PrepareData <- function(enrichMat, clust, ctype, ctype_u, cols){
+  colData <- data.frame(clusters= clust, CellType= ctype)
+  colors <- data.frame(CellType = ctype_u , Cell_colors = cols)
+  colData <- left_join(colData, colors)
+  colData <- colData[match(colnames(enrichMat), colData$clusters),]
+}
+
+PrepareDataH <- function(enrichMat, h_result, h_ord, ctype_u, cols){
+  colData <- data.frame(clusters= names(h_result), KType= h_result)
+  colors <- data.frame(KType= h_ord, CellType = ctype_u , Cell_colors = cols)
+  colData <- left_join(colData, colors)
+  colData <- colData[match(colnames(enrichMat), colData$clusters),]
+  colData <- colData[-2] # delate the KType column
+}
+
+# Get legend
+plot4legend <- function(df){
+  ggplot(df) +
+    geom_bar(mapping = aes(x = clusters, y = 1, fill = CellType), 
+             stat = "identity", 
+             width = 1.1) +
+    scale_fill_manual(labels = unique(df[2:3])$CellType, values = unique(df[2:3])$Cell_colors) +
+    guides(fill=guide_legend(ncol=2))
+}
+
+# Plot HM
+PlotHM <- function(enrichMat, sideCols){
+  heatmap.2 (t(enrichMat), #enrich_hm <- 
+                          # dendrogram control
+                          Rowv = TRUE,
+                          Colv= TRUE,
+                          col = "bluered",
+                          breaks = unique(c(seq(-1, -0.3, length=51), seq(-0.3, 0.3, length=101), seq(0.3, 1, length=51))),
+                          distfun = dist,
+                          trace = "none",
+                          hclustfun = hclust,
+                          dendrogram = "row",
+                          symm=F,symkey=F,symbreaks=T, scale="none",
+                          lmat=rbind(c(5,4,0), c(3,2,1)), 
+                            lhei=c(2,5),
+                          lwid=c(1,4,0.20),
+                          RowSideColors = sideCols$Cell_colors,
+                          cexCol = 0.7,
+                          cexRow = 1.2,
+                          srtCol = 45)
+  legend(y=1.2, x=.8, xpd=TRUE,     
+    legend = unique(sideCols$CellType),
+    col = unique(sideCols$Cell_colors), 
+    lty= 1,             
+    lwd = 5,           
+    cex=.7
+    )
+}
+
+```
+
+Read the objects and Get the correlations between the different genesets inside each object
+
+```{r}
+# from file: "GeneSet_generator_usingPublicData.R"
+date = 231007
+```
+
+CellMarker cells (Mouse)
+```{r}
+GeneSet_CellMarkerMouse <- readRDS(paste0("Outputs/", date, "_GeneSet_CellMarkerMouse.rds"))
+Ollaps_general <- computeGeneSetsOverlap(GeneSet_CellMarkerMouse, unique(unlist(GeneSet_CellMarkerMouse)))
+GeneSetCor(Ollaps_general)
+ggsave(filename = paste0("Outputs/", date, "_GeneSet_CellMarkerMouse_cor.png"))
+```
+
+CellMarker cells (Human)
+
+```{r}
+GeneSet_CellMarkerHuman <- readRDS(paste0("Outputs/", date, "_GeneSet_CellMarkerHuman.rds"))
+Ollaps_general <- computeGeneSetsOverlap(GeneSet_CellMarkerHuman, unique(unlist(GeneSet_CellMarkerHuman)))
+GeneSetCor(Ollaps_general)
+ggsave(filename = paste0("Outputs/", date, "_GeneSet_CellMarkerHuman_cor.png"))
+```
+
+Panglao (Mouse)
+```{r}
+GeneSet_PanglaoMouse <- readRDS(paste0("Outputs/", date, "_GeneSet_PanglaoMouse.rds"))
+Ollaps_Allen  <- computeGeneSetsOverlap(GeneSet_PanglaoMouse, unique(unlist(GeneSet_PanglaoMouse)))
+GeneSetCor(Ollaps_Allen)
+ggsave(filename = paste0("Outputs/", date, "_GeneSet_PanglaoMouse_cor.png"))
+```
+
+Read the file with the average expression of each cluster
+
+```{r}
+# from file: "Cluster_investigation_3rdDataSet_prolijo.R"
+date = 240725
+id <- "all" #"4th" #"3rd" 
+clusters_ctrl <- readRDS(paste0("Outputs/", date, "_Clusters_avg_exp_int_ctrl_", id, ".rds"))
+#clusters_ctrl <- select(clusters_ctrl, names(clusters_ctrl)[!(names(clusters_ctrl) %in% c("19","18","17","16","15","12"))])
+clusters_ctrl <- mutate_all(clusters_ctrl[-length(clusters_ctrl)], as.numeric) %>% as.matrix() #column 24 is "gene_name"
+id <- "all"
+date = 240725
+```
+
+### Plot Seurat Average Expression (just schematic)
+
+```{r}
+#pdf(paste0("Outputs/", date, "_AvgExpressionCtrl_hm", id, ".pdf"))
+prueba <- clusters_ctrl[sample(nrow(clusters_ctrl),50),]
+rownames(prueba) <- NULL
+heatmap.2 (t(rbind(prueba[sample(nrow(prueba)),], prueba[sample(nrow(prueba)),])),
+           # dendrogram control
+           Rowv = FALSE,
+           Colv= TRUE,
+           col = "bluered",
+           breaks = unique(c(seq(-1, -0.3, length=51), seq(-0.3, 0.3, length=101), seq(0.3, 1, length=51))),
+           distfun = dist,
+           trace = "none",
+           hclustfun = hclust,
+           dendrogram = "none",
+           scale = "row")
+#dev.off()
+```
+
+## Run GSVA analysis
+
+#### CellMarker (Mouse)
+
+```{r, include = F}
+enrichCtrl <- gsva(clusters_ctrl, GeneSet_CellMarkerMouse)
+```
+
+```{r}
+d_res <- hclust(dist(t(enrichCtrl)))
+d_res <- cutree(d_res, k = 2)
+# plot
+## Parameters
+d_order = c(1,2)
+CellType_unique = c("Neuron", "Others")
+# In the future I will put:
+# CellType_unique = c("Neuron", "Others", "Microglia", "LC")
+# So:
+#viridis_pal(option = "D")(7)[-c(2,4,7)] #4 colors
+colors_general <- c("#31688EFF", "#8FD744FF", "#35B779FF", "#440154FF")
+## Data preparation
+# annotate
+PrepData_all <- PrepareDataH(enrichCtrl, d_res, d_order, CellType_unique, colors_general[c(1,2)])
+saveRDS(PrepData_all, paste0("Outputs/",date, "_PrepData_CellMarkerMouse", id, ".rds"))
+## Plot HM
+#pdf(paste0("Outputs/", date, "_enrichCtrl_hm_GeneSet_general", id, ".pdf"))
+PlotHM(enrichCtrl, PrepData_all)
+#dev.off()
+```
+
+```{r, include = F}
+enrichCtrl <- gsva(clusters_ctrl, GeneSet_CellMarkerMouse)
+```
+
+```{r}
+d_res <- hclust(dist(t(enrichCtrl)))
+d_res <- cutree(d_res, k = 3)
+# plot
+## Parameters
+d_order = c(1,2,3)
+CellType_unique = c("Neuron", "Others", "Microglia")
+## Data preparation
+# annotate
+PrepData_all <- PrepareDataH(enrichCtrl, d_res, d_order, CellType_unique, colors_general[c(1,2,3)])
+saveRDS(PrepData_all, paste0("Outputs/",date, "_PrepData_CellMarkerMouse", id, ".rds"))
+## Plot HM
+#pdf(paste0("Outputs/", date, "_enrichCtrl_hm_GeneSet_general", id, ".pdf"))
+PlotHM(enrichCtrl, PrepData_all)
+#dev.off()
+```
+
+#### CellMarker (Human)
+
+```{r, include=F}
+enrichCtrl_LC <- gsva(clusters_ctrl, GeneSet_CellMarkerHuman)
+```
+
+```{r}
+d_res <- hclust(dist(t(enrichCtrl_LC)))
+d_res <- cutree(d_res, k = 4)
+# plot
+## Parameters
+d_order = c(1,2,3,4)
+CellType_unique = c("Neuron", "Others", "Microglia", "LC")
+## Data preparation
+# annotate
+PrepData <- PrepareDataH(enrichCtrl_LC, d_res, d_order, CellType_unique, colors_general)
+saveRDS(PrepData, paste0("Outputs/",date, "_PrepData_GeneSet_CellMarkerHuman", id, ".rds"))
+## Get legend
+#pdf(paste0("Outputs/", date, "_enrichCtrl_legend_GeneSet_general_and_LC", id, ".pdf"))
+#as.ggplot(get_legend(plot4legend(PrepData)))
+#dev.off()
+## Plot HM
+#pdf(paste0("Outputs/", date, "_enrichCtrl_hm_GeneSet_general_and_LC", id, ".pdf"))
+PlotHM(enrichCtrl_LC, PrepData)
+#dev.off()
+```
+
+#### Panglao (Mouse)
+
+```{r, include = F}
+enrichCtrl_Allen <- gsva(clusters_ctrl, GeneSet_PanglaoMouse)
+```
+
+```{r}
+d_res <- hclust(dist(t(enrichCtrl_Allen)))
+d_res <- cutree(d_res, k = 5)
+## Plot HeatMap of GSVA data
+## Parameters
+#dres <- c(1,2,3,4,5)
+#d_order = c(1,4,5,3,2)
+d_order = c(1,5,4,2,3)
+CellType_unique = c("Not Ident", "LC", "Neigh or LC", "Neigh2 or LC", "Distant")
+## Data preparation
+#viridis_pal(option = "C")(7)[-c(1,6,7)]
+colors_allen <- c("gray", "#5D01A6FF", "#9C179EFF", "#CC4678FF", "#ED7953FF")
+color_table_allen <- data.frame(CellType_unique, colors = colors_allen)
+PrepData <- PrepareDataH(enrichCtrl_Allen, d_res, d_order, CellType_unique,  colors_allen)
+saveRDS(PrepData, paste0("Outputs/",date, "_PrepData_GeneSet_PanglaoMouse", id, ".rds"))
+## Get legend
+#pdf(paste0("Outputs/", date, "_enrichCtrl_legend_GeneSet_Allen", id, ".pdf"))
+#as.ggplot(get_legend(plot4legend(PrepData))
+#dev.off()
+## Plot HM
+#pdf(paste0("Outputs/", date, "_enrichCtrl_hm_GeneSet_Allen", id, ".pdf"))
+PlotHM(enrichCtrl_Allen, PrepData)
+#dev.off()
+```
+
+## For the 3rdDS
+
+
+```{r}
+# from file: "Cluster_investigation_3rdDataSet_prolijo.R"
+date = 240725
+id <- "3rd" 
+clusters_ctrl <- readRDS(paste0("Outputs/", date, "_Clusters_avg_exp_int_ctrl_", id, ".rds"))
+#clusters_ctrl <- select(clusters_ctrl, names(clusters_ctrl)[!(names(clusters_ctrl) %in% c("19","18","17","16","15","12"))])
+clusters_ctrl <- mutate_all(clusters_ctrl[-length(clusters_ctrl)], as.numeric) %>% as.matrix() #column 24 is "gene_name"
+id <- "3rd"
+date = 240725
+```
+
+### Plot Seura tAverage Expression (just schematic)
+
+```{r}
+#pdf(paste0("Outputs/", date, "_AvgExpressionCtrl_hm", id, ".pdf"))
+prueba <- clusters_ctrl[sample(nrow(clusters_ctrl),50),]
+rownames(prueba) <- NULL
+heatmap.2 (t(rbind(prueba[sample(nrow(prueba)),], prueba[sample(nrow(prueba)),])),
+           # dendrogram control
+           Rowv = FALSE,
+           Colv= TRUE,
+           col = "bluered",
+           breaks = unique(c(seq(-1, -0.3, length=51), seq(-0.3, 0.3, length=101), seq(0.3, 1, length=51))),
+           distfun = dist,
+           trace = "none",
+           hclustfun = hclust,
+           dendrogram = "none",
+           scale = "row")
+#dev.off()
+```
+
+## Run GSVA analysis
+
+#### CellMarker (Mouse)
+
+```{r, include = F}
+enrichCtrl <- gsva(clusters_ctrl, GeneSet_CellMarkerMouse)
+```
+
+```{r}
+d_res <- hclust(dist(t(enrichCtrl)))
+d_res <- cutree(d_res, k = 2)
+# plot
+## Parameters
+d_order = c(1,2)
+CellType_unique = c("Neuron", "Others")
+# In the future I will put:
+# CellType_unique = c("Neuron", "Others", "Microglia", "LC")
+# So:
+#viridis_pal(option = "D")(7)[-c(2,4,7)] #4 colors
+colors_general <- c("#31688EFF", "#8FD744FF", "#35B779FF", "#440154FF")
+## Data preparation
+# annotate
+PrepData_all <- PrepareDataH(enrichCtrl, d_res, d_order, CellType_unique, colors_general[c(1,2)])
+saveRDS(PrepData_all, paste0("Outputs/",date, "_PrepData_CellMarkerMouse", id, ".rds"))
+## Plot HM
+#pdf(paste0("Outputs/", date, "_enrichCtrl_hm_GeneSet_general", id, ".pdf"))
+PlotHM(enrichCtrl, PrepData_all)
+#dev.off()
+```
+
+```{r, include = F}
+enrichCtrl <- gsva(clusters_ctrl, GeneSet_CellMarkerMouse)
+```
+
+```{r}
+d_res <- hclust(dist(t(enrichCtrl)))
+d_res <- cutree(d_res, k = 3)
+# plot
+## Parameters
+d_order = c(1,2,3)
+CellType_unique = c("Neuron", "Others", "Microglia")
+## Data preparation
+# annotate
+PrepData_all <- PrepareDataH(enrichCtrl, d_res, d_order, CellType_unique, colors_general[c(1,2,3)])
+saveRDS(PrepData_all, paste0("Outputs/",date, "_PrepData_CellMarkerMouse", id, ".rds"))
+## Plot HM
+#pdf(paste0("Outputs/", date, "_enrichCtrl_hm_GeneSet_general", id, ".pdf"))
+PlotHM(enrichCtrl, PrepData_all)
+#dev.off()
+```
+
+#### CellMarker (Human)
+
+```{r, include=F}
+enrichCtrl_LC <- gsva(clusters_ctrl, GeneSet_CellMarkerHuman)
+```
+
+```{r}
+d_res <- hclust(dist(t(enrichCtrl_LC)))
+d_res <- cutree(d_res, k = 4)
+# plot
+## Parameters
+d_order = c(1,2,3,4)
+CellType_unique = c("Neuron", "Others", "Microglia", "LC")
+## Data preparation
+# annotate
+PrepData <- PrepareDataH(enrichCtrl_LC, d_res, d_order, CellType_unique, colors_general)
+saveRDS(PrepData, paste0("Outputs/",date, "_PrepData_GeneSet_CellMarkerHuman", id, ".rds"))
+## Get legend
+#pdf(paste0("Outputs/", date, "_enrichCtrl_legend_GeneSet_general_and_LC", id, ".pdf"))
+#as.ggplot(get_legend(plot4legend(PrepData)))
+#dev.off()
+## Plot HM
+#pdf(paste0("Outputs/", date, "_enrichCtrl_hm_GeneSet_general_and_LC", id, ".pdf"))
+PlotHM(enrichCtrl_LC, PrepData)
+#dev.off()
+```
+
+#### Panglao (Mouse)
+
+```{r, include = F}
+enrichCtrl_Allen <- gsva(clusters_ctrl, GeneSet_PanglaoMouse)
+```
+
+```{r}
+d_res <- hclust(dist(t(enrichCtrl_Allen)))
+d_res <- cutree(d_res, k = 5)
+## Plot HeatMap of GSVA data
+## Parameters
+#dres <- c(1,2,3,4,5)
+#d_order = c(1,4,5,3,2)
+d_order = c(1,5,4,2,3)
+CellType_unique = c("Not Ident", "LC", "Neigh or LC", "Neigh2 or LC", "Distant")
+## Data preparation
+#viridis_pal(option = "C")(7)[-c(1,6,7)]
+colors_allen <- c("gray", "#5D01A6FF", "#9C179EFF", "#CC4678FF", "#ED7953FF")
+color_table_allen <- data.frame(CellType_unique, colors = colors_allen)
+PrepData <- PrepareDataH(enrichCtrl_Allen, d_res, d_order, CellType_unique,  colors_allen)
+saveRDS(PrepData, paste0("Outputs/",date, "_PrepData_GeneSet_PanglaoMouse", id, ".rds"))
+## Get legend
+#pdf(paste0("Outputs/", date, "_enrichCtrl_legend_GeneSet_Allen", id, ".pdf"))
+#as.ggplot(get_legend(plot4legend(PrepData))
+#dev.off()
+## Plot HM
+#pdf(paste0("Outputs/", date, "_enrichCtrl_hm_GeneSet_Allen", id, ".pdf"))
+PlotHM(enrichCtrl_Allen, PrepData)
+#dev.off()
+```
+
+## For the 4thDS
+
+
+```{r}
+# from file: "Cluster_investigation_3rdDataSet_prolijo.R"
+date = 240725
+id <- "4th" 
+clusters_ctrl <- readRDS(paste0("Outputs/", date, "_Clusters_avg_exp_int_ctrl_", id, ".rds"))
+#clusters_ctrl <- select(clusters_ctrl, names(clusters_ctrl)[!(names(clusters_ctrl) %in% c("19","18","17","16","15","12"))])
+clusters_ctrl <- mutate_all(clusters_ctrl[-length(clusters_ctrl)], as.numeric) %>% as.matrix() #column 24 is "gene_name"
+id <-  "4th"
+date = 240725
+```
+
+### Plot SeuratAverage Expression (just schematic)
+
+```{r}
+#pdf(paste0("Outputs/", date, "_AvgExpressionCtrl_hm", id, ".pdf"))
+prueba <- clusters_ctrl[sample(nrow(clusters_ctrl),50),]
+rownames(prueba) <- NULL
+heatmap.2 (t(rbind(prueba[sample(nrow(prueba)),], prueba[sample(nrow(prueba)),])),
+           # dendrogram control
+           Rowv = FALSE,
+           Colv= TRUE,
+           col = "bluered",
+           breaks = unique(c(seq(-1, -0.3, length=51), seq(-0.3, 0.3, length=101), seq(0.3, 1, length=51))),
+           distfun = dist,
+           trace = "none",
+           hclustfun = hclust,
+           dendrogram = "none",
+           scale = "row")
+#dev.off()
+```
+
+## Run GSVA analysis
+
+#### CellMarker (Mouse)
+
+```{r, include = F}
+enrichCtrl <- gsva(clusters_ctrl, GeneSet_CellMarkerMouse)
+```
+
+```{r}
+d_res <- hclust(dist(t(enrichCtrl)))
+d_res <- cutree(d_res, k = 2)
+# plot
+## Parameters
+d_order = c(1,2)
+CellType_unique = c("Neuron", "Others")
+# In the future I will put:
+# CellType_unique = c("Neuron", "Others", "Microglia", "LC")
+# So:
+#viridis_pal(option = "D")(7)[-c(2,4,7)] #4 colors
+colors_general <- c("#31688EFF", "#8FD744FF", "#35B779FF", "#440154FF")
+## Data preparation
+# annotate
+PrepData_all <- PrepareDataH(enrichCtrl, d_res, d_order, CellType_unique, colors_general[c(1,2)])
+saveRDS(PrepData_all, paste0("Outputs/",date, "_PrepData_CellMarkerMouse", id, ".rds"))
+## Plot HM
+#pdf(paste0("Outputs/", date, "_enrichCtrl_hm_GeneSet_general", id, ".pdf"))
+PlotHM(enrichCtrl, PrepData_all)
+#dev.off()
+```
+
+```{r, include = F}
+enrichCtrl <- gsva(clusters_ctrl, GeneSet_CellMarkerMouse)
+```
+
+```{r}
+d_res <- hclust(dist(t(enrichCtrl)))
+d_res <- cutree(d_res, k = 3)
+# plot
+## Parameters
+d_order = c(1,2,3)
+CellType_unique = c("Neuron", "Others", "Microglia")
+## Data preparation
+# annotate
+PrepData_all <- PrepareDataH(enrichCtrl, d_res, d_order, CellType_unique, colors_general[c(1,2,3)])
+saveRDS(PrepData_all, paste0("Outputs/",date, "_PrepData_CellMarkerMouse", id, ".rds"))
+## Plot HM
+#pdf(paste0("Outputs/", date, "_enrichCtrl_hm_GeneSet_general", id, ".pdf"))
+PlotHM(enrichCtrl, PrepData_all)
+#dev.off()
+```
+
+#### CellMarker (Human)
+
+```{r, include=F}
+enrichCtrl_LC <- gsva(clusters_ctrl, GeneSet_CellMarkerHuman)
+```
+
+```{r}
+d_res <- hclust(dist(t(enrichCtrl_LC)))
+d_res <- cutree(d_res, k = 4)
+# plot
+## Parameters
+d_order = c(1,2,3,4)
+CellType_unique = c("Neuron", "Others", "Microglia", "LC")
+## Data preparation
+# annotate
+PrepData <- PrepareDataH(enrichCtrl_LC, d_res, d_order, CellType_unique, colors_general)
+saveRDS(PrepData, paste0("Outputs/",date, "_PrepData_GeneSet_CellMarkerHuman", id, ".rds"))
+## Get legend
+#pdf(paste0("Outputs/", date, "_enrichCtrl_legend_GeneSet_general_and_LC", id, ".pdf"))
+#as.ggplot(get_legend(plot4legend(PrepData)))
+#dev.off()
+## Plot HM
+#pdf(paste0("Outputs/", date, "_enrichCtrl_hm_GeneSet_general_and_LC", id, ".pdf"))
+PlotHM(enrichCtrl_LC, PrepData)
+#dev.off()
+```
+
+#### Panglao (Mouse)
+
+```{r, include = F}
+enrichCtrl_Allen <- gsva(clusters_ctrl, GeneSet_PanglaoMouse)
+```
+
+```{r}
+d_res <- hclust(dist(t(enrichCtrl_Allen)))
+d_res <- cutree(d_res, k = 5)
+## Plot HeatMap of GSVA data
+## Parameters
+#dres <- c(1,2,3,4,5)
+#d_order = c(1,4,5,3,2)
+d_order = c(1,5,4,2,3)
+CellType_unique = c("Not Ident", "LC", "Neigh or LC", "Neigh2 or LC", "Distant")
+## Data preparation
+#viridis_pal(option = "C")(7)[-c(1,6,7)]
+colors_allen <- c("gray", "#5D01A6FF", "#9C179EFF", "#CC4678FF", "#ED7953FF")
+color_table_allen <- data.frame(CellType_unique, colors = colors_allen)
+PrepData <- PrepareDataH(enrichCtrl_Allen, d_res, d_order, CellType_unique,  colors_allen)
+saveRDS(PrepData, paste0("Outputs/",date, "_PrepData_GeneSet_PanglaoMouse", id, ".rds"))
+## Get legend
+#pdf(paste0("Outputs/", date, "_enrichCtrl_legend_GeneSet_Allen", id, ".pdf"))
+#as.ggplot(get_legend(plot4legend(PrepData))
+#dev.off()
+## Plot HM
+#pdf(paste0("Outputs/", date, "_enrichCtrl_hm_GeneSet_Allen", id, ".pdf"))
+PlotHM(enrichCtrl_Allen, PrepData)
+#dev.off()
+```
+
+

@@ -1,0 +1,724 @@
+---
+title: "EulerPlots"
+author: "Camila Arcuschin; Ignacio Schor"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    theme: cerulean
+    code_folding: hide
+    out.width: 6
+    out.heigh: 6
+    fig.width: 6
+    fig.height: 6
+editor_options: 
+  markdown: 
+  wrap: 72
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, echo = TRUE, warning = FALSE, dpi = 500) #dev = c('pdf', 'png') # If I want to export plots but don't look to the html (because it is too heavy). Remember to also add: clean = FALSE, as a parameter of the rmarkdown::render() function, when executing 
+knitr::opts_knit$set(root.dir = "/data_husihuilke/shared/SMB/carcu/Parkinsons_project/")
+```
+
+```{r, include=FALSE}
+library(readr)
+library(dplyr)
+library(eulerr)
+library(ggplot2)
+library(purrr)
+library(ggrepel)
+library(plotly)
+```
+
+### Select DE genes to try to prioritize LC DE genes to further study
+
+I get the genes that I considered DE on the LC with a strict criteria on the log2FC (absolute log2FC \> 1) since I am being less stricted in using p value and not p adjusted value for selection. Then I applied a broad criteria on log2FC (absolute log2FC \> 0.3 but p.adj \<= 0.05) for SN DE genes to use them as a filter of LC genes: I will try to further study the DE genes on the LC (1mo or 2mo), a more resistanr region, that are not DE genes on the SN, a more vulnerable region.
+
+```{r Functions}
+#### Functions ####
+
+# Read files
+read_file_SN <- function(SubType, sigSign, clust, mo) {
+  tb <- read_csv(paste0("Outputs/240102_FCmat_clust", clust, "_", mo, "_SN.csv"))
+  if (sigSign == "pos"){
+    tb <- filter(tb, pvalue <= 0.05, log2FC >= 0.2)
+  } else if(sigSign == "neg"){
+    tb <- filter(tb, pvalue <= 0.05, log2FC <= -0.2)
+  } else {
+    tb <- filter(tb, pvalue <= 0.05, abs(log2FC) >= 0.2)
+  }
+  return(tb)
+}
+
+read_file_LC <- function(SubType, sigSign, clust, mo) {
+  tb <- read_csv(paste0("Outputs/231214_FCmat_posthoc_nofilter_log2FC_clust", clust, "_", mo, "_LC.csv"))
+  nonDE_genes <- readRDS(paste0("Outputs/231214_genes_replicate_specific_clust", clust, "_", mo, "_LC.rds"))
+  if (sigSign == "pos"){
+    tb <- filter(tb, pvalue <= 0.05, log2FC >= 0.2, !(Gene %in% nonDE_genes))
+  } else if(sigSign == "neg"){
+    tb <- filter(tb, pvalue <= 0.05, log2FC <= -0.2, !(Gene %in% nonDE_genes))
+  } else {
+    tb <- filter(tb, pvalue <= 0.05, abs(log2FC) >= 0.2, !(Gene %in% nonDE_genes))
+  }
+  return(tb)
+}
+
+# Get the set of peaks that are differentially active in one Group and NOT in others
+disjunction <- function(dflist, Group, GroupNames) {
+  Others <- GroupNames[!(GroupNames %in% Group)]
+  dflist[[Group]] %>% filter(!(Gene %in% dflist[[Others[1]]]$Gene |
+                                 Gene %in% dflist[[Others[2]]]$Gene |
+                                 Gene %in% dflist[[Others[3]]]$Gene))
+  # |
+  #                                Gene %in% dflist[[Others[4]]]$Gene |
+  #                                Gene %in% dflist[[Others[5]]]$Gene |
+  #                                Gene %in% dflist[[Others[6]]]$Gene
+}
+
+# Get the set of peaks that are differentially active in one 2 Groups and NOT in others
+union2<-function(dflist, Group1, Group2, GroupNames){
+  Others<-GroupNames[!(GroupNames %in% c(Group1, Group2))]
+  dflist[[Group1]] %>% filter(Gene %in% dflist[[Group2]]$Gene & 
+                                !(Gene %in% dflist[[Others[1]]]$Gene |
+                                 Gene %in% dflist[[Others[2]]]$Gene))
+}
+
+# Get the set of peaks that are differentially active in one 3 Groups and NOT in others
+union3<-function(dflist, Group1, Group2, Group3, GroupNames){
+  Others<-GroupNames[!(GroupNames %in% c(Group1, Group2, Group3))]
+  dflist[[Group1]] %>% filter(Gene %in% dflist[[Group2]]$Gene & 
+                                Gene %in% dflist[[Group3]]$Gene &
+                                !(Gene %in% dflist[[Others[1]]]$Gene ))
+}
+
+union4<-function(dflist, Group1, Group2, Group3, Group4, GroupNames){
+  Others<-GroupNames[!(GroupNames %in% c(Group1, Group2, Group3, Group4))]
+  dflist[[Group1]] %>% filter(Gene %in% dflist[[Group2]]$Gene & 
+                                Gene %in% dflist[[Group3]]$Gene &
+                                Gene %in% dflist[[Group4]]$Gene )
+}
+
+# union5<-function(dflist, Group1, Group2, Group3, Group4, Group5, GroupNames){
+#   Others<-GroupNames[!(GroupNames %in% c(Group1, Group2, Group3, Group4, Group5))]
+#   dflist[[Group1]] %>% filter(Gene %in% dflist[[Group2]]$Gene & 
+#                                 Gene %in% dflist[[Group3]]$Gene &
+#                                 Gene %in% dflist[[Group4]]$Gene &
+#                                 Gene %in% dflist[[Group5]]$Gene &
+#                                 !(Gene %in% dflist[[Others[1]]]$Gene|
+#                                  Gene %in% dflist[[Others[2]]]$Gene))
+# }
+# 
+# union6<-function(dflist, Group1, Group2, Group3, Group4, Group5, Group6, GroupNames){
+#   Others<-GroupNames[!(GroupNames %in% c(Group1, Group2, Group3, Group4, Group5, Group6))]
+#   dflist[[Group1]] %>% filter(Gene %in% dflist[[Group2]]$Gene & 
+#                                 Gene %in% dflist[[Group3]]$Gene &
+#                                 Gene %in% dflist[[Group4]]$Gene &
+#                                 Gene %in% dflist[[Group5]]$Gene &
+#                                 Gene %in% dflist[[Group6]]$Gene &
+#                                 !(Gene %in% dflist[[Others[1]]]$Gene))
+# }
+# 
+# union7<-function(dflist, Group1, Group2, Group3, Group4, Group5, Group6, Group7){ #GroupNames
+#   #Others<-GroupNames[!(GroupNames %in% c(Group1, Group2, Group3, Group4, Group5, Group6, Group7))]
+#   dflist[[Group1]] %>% filter(Gene %in% dflist[[Group2]]$Gene & 
+#                                 Gene %in% dflist[[Group3]]$Gene &
+#                                 Gene %in% dflist[[Group4]]$Gene &
+#                                 Gene %in% dflist[[Group5]]$Gene &
+#                                 Gene %in% dflist[[Group6]]$Gene &
+#                                 Gene %in% dflist[[Group7]]$Gene)
+# }
+
+
+### combinations
+
+combinations_of_2 <- function(n){
+lista=list()
+for(i in 1:length(n)){
+  for(j in 1:length(n)){
+    if(j!=i){
+  lista[[length(lista)+1]]=sort(c(n[i], n[j]))
+  }
+    }}
+return(unique(lista))
+}
+
+combinations_of_3 <- function(n){
+lista=list()
+for(i in 1:length(n)){
+  for(j in 1:length(n)){
+    if(j!=i){
+    for(h in 1:length(n)){
+      if(h!=j & h!=i){
+  lista[[length(lista)+1]]=sort(c(n[i], n[j],n[h]))
+  }
+    }}}}
+return(unique(lista))
+}
+
+combinations_of_4 <- function(n){
+lista=list()
+for(i in 1:length(n)){
+  for(j in 1:length(n)){
+    if(j!=i){
+    for(h in 1:length(n)){
+      if(h!=j & h!=i){
+        for(m in 1:length(n)){
+          if(m!=h & m!=j & m!=h & m!=i)
+  lista[[length(lista)+1]]=sort(c(n[i], n[j],n[h], n[m]))
+  }
+    }}}}}
+return(unique(lista))
+}
+
+combinations_of_5 <- function(n){
+lista=list()
+for(i in 1:length(n)){
+  for(j in 1:length(n)){
+    if(j!=i){
+    for(h in 1:length(n)){
+      if(h!=j & h!=i){
+        for(m in 1:length(n)){
+          if(m!=h & m!=j & m!=h & m!=i){
+            for(s in 1:length(n)){
+              if(s!=m & s!=h & s!=j & s!=i){
+  lista[[length(lista)+1]]=sort(c(n[i], n[j],n[h], n[m], n[s]))
+  }
+    }}}}}}}}
+return(unique(lista))
+}
+
+combinations_of_6 <- function(n){
+lista=list()
+for(i in 1:length(n)){
+  for(j in 1:length(n)){
+    if(j!=i){
+    for(h in 1:length(n)){
+      if(h!=j & h!=i){
+        for(m in 1:length(n)){
+          if(m!=h & m!=j & m!=h & m!=i){
+            for(s in 1:length(n)){
+              if(s!=m & s!=h & s!=j & s!=i){
+                for(k in 1:length(n)){
+                  if(k!=s & k!=m & k!=h & k!=j & k!=i){
+  lista[[length(lista)+1]]=sort(c(n[i], n[j],n[h], n[m], n[s], n[k]))
+  }
+    }}}}}}}}}}
+return(unique(lista))
+}
+
+combinations_of_7 <- function(n){
+lista=list()
+for(i in 1:length(n)){
+  for(j in 1:length(n)){
+    if(j!=i){
+    for(h in 1:length(n)){
+      if(h!=j & h!=i){
+        for(m in 1:length(n)){
+          if(m!=h & m!=j & m!=h & m!=i){
+            for(s in 1:length(n)){
+              if(s!=m & s!=h & s!=j & s!=i){
+                for(k in 1:length(n)){
+                  if(k!=s & k!=m & k!=h & k!=j & k!=i){
+                    for(f in 1:length(n)){
+                      if(f!=k & f!=s & f!=m & f!=h & f!=j & f!=i){
+  lista[[length(lista)+1]]=sort(c(n[i], n[j],n[h], n[m], n[s], n[k], n[f]))
+  }
+    }}}}}}}}}}}}
+return(unique(lista))
+}
+
+#disjunction
+disjunc <- function(alist, SubTypes){
+  disj <- list()
+  dim_disj <- c()
+  for (i in 1:length(alist)){
+    disj[[i]] <- disjunction(alist, names(alist)[i], unlist(SubTypes))
+    dim_disj[i] <- dim(disj[[i]])[1]
+  }
+  names(disj) <- unlist(SubTypes)
+  names(dim_disj) <- unlist(SubTypes)
+  return(list("disj" = disj, "dim_disj" = dim_disj))
+}
+
+#Union betweeen 2 groups
+un_2 <- function(alist, SubTypes, comb_2){
+  un <- list()
+  dim_un <- c()
+  for (i in 1:length(comb_2)){
+    un[[i]] <- union2(alist, comb_2[[i]][1], comb_2[[i]][2], unlist(SubTypes))
+    dim_un[i] <- dim(un[[i]])[1]
+  }
+  names(un) <- lapply(comb_2, function(x) paste0(x[1], "&", x[2]))
+  names(dim_un) <- lapply(comb_2, function(x) paste0(x[1], "&", x[2]))
+  return(list("un" = un, "dim_un" = dim_un))
+}
+
+#Union betweeen 3 groups
+un_3 <- function(alist, SubTypes, comb_3){
+  un <- list()
+  dim_un <- c()
+  for (i in 1:length(comb_3)){
+    un[[i]] <- union3(alist, comb_3[[i]][1], comb_3[[i]][2], comb_3[[i]][3], unlist(SubTypes))
+    dim_un[i] <- dim(un[[i]])[1]
+  }
+  names(un) <- lapply(comb_3, function(x) paste0(x[1], "&", x[2], "&", x[3]))
+  names(dim_un) <- lapply(comb_3, function(x) paste0(x[1], "&", x[2], "&", x[3]))
+  return(list("un" = un, "dim_un" = dim_un))
+}
+
+#Union betweeen 4 groups
+un_4 <- function(alist, SubTypes, comb_4){
+  un <- list()
+  dim_un <- c()
+  for (i in 1:length(comb_4)){
+    un[[i]] <- union4(alist, comb_4[[i]][1], comb_4[[i]][2], comb_4[[i]][3], comb_4[[i]][4], unlist(SubTypes))
+    dim_un[i] <- dim(un[[i]])[1]
+  }
+  names(un) <- lapply(comb_4, function(x) paste0(x[1], "&", x[2], "&", x[3], "&", x[4]))
+  names(dim_un) <- lapply(comb_4, function(x) paste0(x[1], "&", x[2], "&", x[3], "&", x[4]))
+  return(list("un" = un, "dim_un" = dim_un))
+}
+
+#Union betweeen 5 groups
+un_5 <- function(alist, SubTypes, comb_5){
+  un <- list()
+  dim_un <- c()
+  for (i in 1:length(comb_5)){
+    un[[i]] <- union5(alist, comb_5[[i]][1], comb_5[[i]][2], comb_5[[i]][3], comb_5[[i]][4], comb_5[[i]][5], unlist(SubTypes))
+    dim_un[i] <- dim(un[[i]])[1]
+  }
+  names(un) <- lapply(comb_5, function(x) paste0(x[1], "&", x[2], "&", x[3], "&", x[4], "&", x[5]))
+  names(dim_un) <- lapply(comb_5, function(x) paste0(x[1], "&", x[2], "&", x[3], "&", x[4], "&", x[5]))
+  return(list("un" = un, "dim_un" = dim_un))
+}
+
+#Union betweeen 6 groups
+un_6 <- function(alist, SubTypes, comb_6){
+  un <- list()
+  dim_un <- c()
+  for (i in 1:length(comb_6)){
+    un[[i]] <- union6(alist, comb_6[[i]][1], comb_6[[i]][2], comb_6[[i]][3], comb_6[[i]][4], comb_6[[i]][5], comb_6[[i]][6], unlist(SubTypes))
+    dim_un[i] <- dim(un[[i]])[1]
+  }
+  names(un) <- lapply(comb_6, function(x) paste0(x[1], "&", x[2], "&", x[3], "&", x[4], "&", x[5], "&", x[6]))
+  names(dim_un) <- lapply(comb_6, function(x) paste0(x[1], "&", x[2], "&", x[3], "&", x[4], "&", x[5], "&", x[6]))
+  return(list("un" = un, "dim_un" = dim_un))
+}
+
+#Union betweeen 7 groups
+un_7 <- function(alist, SubTypes, comb_7){
+  un <- list()
+  dim_un <- c()
+  for (i in 1:length(comb_7)){
+    un[[i]] <- union6(alist, comb_7[[i]][1], comb_7[[i]][2], comb_7[[i]][3], comb_7[[i]][4], comb_7[[i]][5], comb_7[[i]][6], comb_7[[i]][7]) #GroupNames
+    dim_un[i] <- dim(un[[i]])[1]
+  }
+  names(un) <- lapply(comb_7, function(x) paste0(x[1], "&", x[2], "&", x[3], "&", x[4], "&", x[5], "&", x[6], "&", x[7]))
+  names(dim_un) <- lapply(comb_7, function(x) paste0(x[1], "&", x[2], "&", x[3], "&", x[4], "&", x[5], "&", x[6], "&", x[7]))
+  return(list("un" = un, "dim_un" = dim_un))
+}
+
+cols <- c("#f37735", "#00b159", "#B56576", "#096a82", "cornflowerblue", "purple" , "#0c8255", "#055738", "gray", "#80192f", "#a33e08", "#2ec98f", "#68e3b5", "black")
+names <- c("GABA.GlutA", "GlutA-1",  "AC", "Olig", "MG", "EP", "GlutA-2", "GlutA-3", "UnKw", "BARR.GlutA", "GABA", "GlutA-4", "GlutA-5", "NE")
+clust <- c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "13", "14")
+aesdf<- data.frame(cols, names, clust)
+
+```
+
+### Upregulated
+
+```{r}
+
+#### Execute ####
+
+## 2mo
+
+# Set the subtypes I'm working with
+SubTypes_LC_1mo<-list("clust19-1mo")
+SubTypes_LC_2mo<-list("clust19-2mo")
+SubTypes_SN_1mo<-list("clust4-1mo")
+SubTypes_SN_2mo<-list("clust4-2mo")
+
+
+# Set the round of the inputs
+comments<- "231108_Cluster19_19_4_4_1mo_2mo_1mo_2mo"
+
+## LC
+# Read tsv files of differentially over and under activated genes
+#Over activated
+contar_Obj_pos_LC_1mo<-map(SubTypes_LC_1mo, read_file_LC, sigSign = "pos", clust = 19, mo = "1mo")
+names(contar_Obj_pos_LC_1mo)<-unlist(SubTypes_LC_1mo)
+#Under activated
+contar_Obj_neg_LC_1mo<-map(SubTypes_LC_1mo, read_file_LC, sigSign = "neg", clust = 19, mo = "1mo")
+names(contar_Obj_neg_LC_1mo)<-unlist(SubTypes_LC_1mo)
+# Read tsv files of differentially activated genes in any Group
+contar_Obj_all_LC_1mo<-map(SubTypes_LC_1mo, read_file_LC, sigSign = "all", clust = 19, mo = "1mo")
+names(contar_Obj_all_LC_1mo)<-unlist(SubTypes_LC_1mo)
+# Read tsv files of differentially over and under activated genes
+#Over activated
+contar_Obj_pos_LC_2mo<-map(SubTypes_LC_2mo, read_file_LC, sigSign = "pos", clust = 19, mo = "2mo")
+names(contar_Obj_pos_LC_2mo)<-unlist(SubTypes_LC_2mo)
+#Under activated
+contar_Obj_neg_LC_2mo<-map(SubTypes_LC_2mo, read_file_LC, sigSign = "neg", clust = 19, mo = "2mo")
+names(contar_Obj_neg_LC_2mo)<-unlist(SubTypes_LC_2mo)
+# Read tsv files of differentially activated genes in any Group
+contar_Obj_all_LC_2mo<-map(SubTypes_LC_2mo, read_file_LC, sigSign = "all", clust = 19, mo = "2mo")
+names(contar_Obj_all_LC_2mo)<-unlist(SubTypes_LC_2mo)
+## SN
+# Read tsv files of differentially over and under activated genes
+#Over activated
+contar_Obj_pos_SN_1mo<-map(SubTypes_SN_1mo, read_file_SN, sigSign = "pos", clust = 4, mo = "1mo")
+names(contar_Obj_pos_SN_1mo)<-unlist(SubTypes_SN_1mo)
+#Under activated
+contar_Obj_neg_SN_1mo<-map(SubTypes_SN_1mo, read_file_SN, sigSign = "neg", clust = 4, mo = "1mo")
+names(contar_Obj_neg_SN_1mo)<-unlist(SubTypes_SN_1mo)
+# Read tsv files of differentially activated genes in any Group
+contar_Obj_all_SN_1mo<-map(SubTypes_SN_1mo, read_file_SN, sigSign = "all", clust = 4, mo = "1mo")
+names(contar_Obj_all_SN_1mo)<-unlist(SubTypes_SN_1mo)
+# Read tsv files of differentially over and under activated genes
+#Over activated
+contar_Obj_pos_SN_2mo<-map(SubTypes_SN_2mo, read_file_SN, sigSign = "pos", clust = 4, mo = "2mo")
+names(contar_Obj_pos_SN_2mo)<-unlist(SubTypes_SN_2mo)
+#Under activated
+contar_Obj_neg_SN_2mo<-map(SubTypes_SN_2mo, read_file_SN, sigSign = "neg", clust = 4, mo = "2mo")
+names(contar_Obj_neg_SN_2mo)<-unlist(SubTypes_SN_2mo)
+# Read tsv files of differentially activated genes in any Group
+contar_Obj_all_SN_2mo<-map(SubTypes_SN_2mo, read_file_SN, sigSign = "all", clust = 4, mo = "2mo")
+names(contar_Obj_all_SN_2mo)<-unlist(SubTypes_SN_2mo)
+
+contar_Obj_pos <- c(contar_Obj_pos_LC_1mo, contar_Obj_pos_LC_2mo, contar_Obj_pos_SN_1mo, contar_Obj_pos_SN_2mo)
+#names(contar_Obj_pos)<-c(paste(unlist(SubTypes), "_1mo", sep = ""), paste(unlist(SubTypes), "_2mo", sep = ""))
+contar_Obj_neg <- c(contar_Obj_neg_LC_1mo, contar_Obj_neg_LC_2mo, contar_Obj_neg_SN_1mo, contar_Obj_neg_SN_2mo)
+#names(contar_Obj_neg)<-c(paste(unlist(SubTypes), "_1mo", sep = ""), paste(unlist(SubTypes), "_2mo", sep = ""))
+
+#SubTypes<-list("clust0_1mo", "clust1_1mo", "clust0_2mo", "clust1_2mo") #, "clust7"
+
+SubTypes <- names(contar_Obj_pos)
+
+disj_out <- disjunc(contar_Obj_pos, SubTypes)
+un_2_out <- un_2(contar_Obj_pos, SubTypes, combinations_of_2(n = unlist(SubTypes)))
+un_3_out <- un_3(contar_Obj_pos, SubTypes, combinations_of_3(n = unlist(SubTypes)))
+un_4_out <- un_4(contar_Obj_pos, SubTypes, combinations_of_4(n = unlist(SubTypes)))
+
+euler_plot <- venn (c(disj_out$dim_disj, un_2_out$dim_un, un_3_out$dim_un,
+                       un_4_out$dim_un))
+# euler_plot <- euler (c(disj_out$dim_disj, un_2_out$dim_un, un_3_out$dim_un, un_4_out$dim_un), 
+#                      shape = "ellipse")
+
+pdf(paste0("Outputs/240624_Euler_DEA_pos_", comments, ".pdf"))
+# aesdf_f <- filter(aesdf, clust %in% c("0", "1", "4", "7"))
+# aesdf_f <- aesdf_f[match(c("0", "1", "4", "7"), aesdf_f$clust),]
+print(plot(euler_plot,
+           fill = c("red", "yellow", "blue", "green"), #aesdf_f$cols,
+           labels = list(col = rep("black",4), labels = c("LC_1mo","LC_2mo", "SN_1mo", "SN_2mo")), #aesdf_f$names),
+           quantities = list(type = "counts", 
+                       col = "white"),
+           edges = list(col = "white")))
+
+print(plot(euler_plot,
+           fill = c("red", "yellow", "blue", "green"), #aesdf_f$cols,
+           labels = NULL,
+           quantities = NULL,
+           edges = list(col = "white")))
+dev.off()
+print(plot(euler_plot,
+           fill = c("red", "yellow", "blue", "green"), #aesdf_f$cols,
+           labels = list(col = rep("black",4), labels = c("LC_1mo","LC_2mo", "SN_1mo", "SN_2mo")), #aesdf_f$names),
+           quantities = list(type = "counts", 
+                       col = "white"),
+           edges = list(col = "white")))
+
+euler_data <- c(disj_out, un_2_out$un, un_3_out$un, un_4_out$un) #, un_4_out$un
+saveRDS(euler_data, paste0("Outputs/240624_euler_data_", comments, "_pos.rds"))
+```
+
+### Downregulated
+
+```{r}
+SubTypes <- names(contar_Obj_neg)
+
+disj_out <- disjunc(contar_Obj_neg, SubTypes)
+un_2_out <- un_2(contar_Obj_neg, SubTypes, combinations_of_2(n = unlist(SubTypes)))
+un_3_out <- un_3(contar_Obj_neg, SubTypes, combinations_of_3(n = unlist(SubTypes)))
+un_4_out <- un_4(contar_Obj_neg, SubTypes, combinations_of_4(n = unlist(SubTypes)))
+
+euler_plot <- venn (c(disj_out$dim_disj, un_2_out$dim_un, un_3_out$dim_un,
+                       un_4_out$dim_un))
+# euler_plot <- euler (c(disj_out$dim_disj, un_2_out$dim_un, un_3_out$dim_un, un_4_out$dim_un), 
+#                      shape = "ellipse")
+
+pdf(paste0("Outputs/240624_Euler_DEA_neg_", comments, ".pdf"))
+# aesdf_f <- filter(aesdf, clust %in% c("0", "1", "4", "7"))
+# aesdf_f <- aesdf_f[match(c("0", "1", "4", "7"), aesdf_f$clust),]
+print(plot(euler_plot,
+           fill = c("red", "yellow", "blue", "green"), #aesdf_f$cols,
+           labels = list(col = c("black","white", rep("black",5)), labels = c("LC_1mo","LC_2mo", "SN_1mo", "SN_2mo")), #aesdf_f$names),
+           quantities = list(type = "counts", 
+                       col = "white"),
+           edges = list(col = "white")))
+
+print(plot(euler_plot,
+           fill = c("red", "yellow", "blue", "green"), #aesdf_f$cols,
+           labels = NULL,
+           quantities = NULL,
+           edges = list(col = "white")))
+dev.off()
+print(plot(euler_plot,
+           fill = c("red", "yellow", "blue", "green"), #aesdf_f$cols,
+           labels = list(col = c("black","white", rep("black",5)), labels = c("LC_1mo","LC_2mo", "SN_1mo", "SN_2mo")), #aesdf_f$names),
+           quantities = list(type = "counts", 
+                       col = "white"),
+           edges = list(col = "white")))
+
+euler_data <- c(disj_out, un_2_out$un, un_3_out$un, un_4_out$un) #, un_4_out$un
+saveRDS(euler_data, paste0("Outputs/240624_euler_data_", comments, "_neg.rds"))
+```
+
+### LC 1mo and 2mo vs all
+
+```{r}
+# contar_Obj_all <- c(contar_Obj_pos_LC_1mo, contar_Obj_neg_LC_1mo, contar_Obj_pos_LC_2mo, contar_Obj_neg_LC_2mo, contar_Obj_all_SN)
+# 
+# SubTypes <- c("clust19-1mo-pos", "clust19-1mo-neg", "clust19-2mo-pos", "clust19-2mo-neg", "clust4")
+# names(contar_Obj_all) <- SubTypes
+# 
+# disj_out <- disjunc(contar_Obj_all, SubTypes)
+# un_2_out <- un_2(contar_Obj_all, SubTypes, combinations_of_2(n = unlist(SubTypes)))
+# un_3_out <- un_3(contar_Obj_all, SubTypes, combinations_of_3(n = unlist(SubTypes)))
+# un_4_out <- un_4(contar_Obj_all, SubTypes, combinations_of_4(n = unlist(SubTypes)))
+# un_5_out <- un_5(contar_Obj_all, SubTypes, combinations_of_5(n = unlist(SubTypes)))
+# 
+# euler_plot <- euler (c(disj_out$dim_disj, un_2_out$dim_un, un_3_out$dim_un, un_4_out$dim_un, un_5_out$dim_un),
+#                      shape = "ellipse")
+# 
+# pdf(paste0("Outputs/Euler_240624_DEA_all_", comments, ".pdf"))
+# print(plot(euler_plot,
+#            fill = c("red", "violet", "orange", "yellow", "blue"), #aesdf_f$cols,
+#            labels = list(col = c("black","white", rep("black",5)), labels = c("LC_1mo-pos", "LC_1mo-neg", "LC_2mo-pos", "LC_2mo-neg", "SN_1mo")), #aesdf_f$names),
+#            quantities = list(type = "counts", 
+#                        col = "white"),
+#            edges = list(col = "white")))
+# 
+# print(plot(euler_plot,
+#            fill = c("red", "violet", "orange", "yellow", "blue"), #aesdf_f$cols,
+#            labels = NULL,
+#            quantities = NULL,
+#            edges = list(col = "white")))
+# dev.off()
+# print(plot(euler_plot,
+#            fill = c("red", "violet", "orange", "yellow", "blue"), #aesdf_f$cols,
+#            labels = list(col = c("black","white", rep("black",5)), labels = c("LC_1mo-pos", "LC_1mo-neg", "LC_2mo-pos", "LC_2mo-neg", "SN_1mo")), #aesdf_f$names),
+#            quantities = list(type = "counts", 
+#                        col = "white"),
+#            edges = list(col = "white")))
+# 
+# euler_data <- c(disj_out$un, un_2_out$un, un_3_out$un, un_4_out$un, un_5_out$un)
+# saveRDS(euler_data, paste0("Outputs/240624_euler_data_", comments, "_all.rds"))
+```
+
+Since there are no DE genes on the LC that are also DE genes on the SN, I cannot have that filter, however, I am going to inspect a little bit further the log2FC of DE genes in the LC (pvalue \<= 0.05) between 1mo and 2mo and then with the log2FC of DE genes on the SN (padj \<= 0.05)
+
+```{r}
+SHSY5Y_aSyn_reg_genes_df <- readRDS("Outputs/240707_SHSY5Y_aSyn_reg_genes.rds")
+HumanGenes_SN_LC_de_res <- readRDS("Outputs/HumanGenes_SN_LC_de_res.rds")
+
+SN_1mo <- read_csv(paste0("Outputs/240102_FCmat_clust", 4, "_", "1mo", "_SN.csv"))
+SN_2mo <- read_csv(paste0("Outputs/240102_FCmat_clust", 4, "_", "2mo", "_SN.csv"))
+
+LC_1mo <- read_csv(paste0("Outputs/231214_FCmat_posthoc_nofilter_log2FC_clust", 19, "_", "1mo", "_LC.csv"))
+LC_1mo_nonDE_genes <- readRDS(paste0("Outputs/231214_genes_replicate_specific_clust", 19, "_", "1mo", "_LC.rds"))
+LC_2mo <- read_csv(paste0("Outputs/231214_FCmat_posthoc_nofilter_log2FC_clust", 19, "_", "2mo", "_LC.csv"))
+LC_2mo_nonDE_genes <- readRDS(paste0("Outputs/231214_genes_replicate_specific_clust", 19, "_", "2mo", "_LC.rds"))
+
+plotly_width <- 1000
+plotly_height <- 600
+
+LC_1mo_2mo <- full_join(LC_1mo, LC_2mo, by = "Gene", suffix = c(".1mo", ".2mo"))
+LC_1mo_2mo <- mutate_if(LC_1mo_2mo, grepl("log2FC", names(LC_1mo_2mo)), function(x) ifelse(is.na(x), 0, x)) %>%  dplyr::select("log2FC.1mo", "log2FC.2mo", "Gene", "pvalue.1mo", "pvalue.2mo")
+LC_1mo_2mo <- filter(LC_1mo_2mo, !((Gene %in% LC_1mo_nonDE_genes) & (Gene %in% LC_2mo_nonDE_genes)), (pvalue.1mo <= 0.05 | pvalue.2mo <= 0.05) )
+LC_1mo_2mo <- mutate(LC_1mo_2mo, class = if_else(pvalue.1mo <= 0.05 & pvalue.2mo <= 0.05, "DE in both", "DE in just one"))
+LC_1mo_2mo <- mutate(LC_1mo_2mo, class = if_else(pvalue.1mo <= 0.05 & pvalue.2mo > 0.05, "DE in 1mo", class))
+LC_1mo_2mo <- mutate(LC_1mo_2mo, class = if_else(pvalue.1mo > 0.05 & pvalue.2mo <= 0.05, "DE in 2mo", class))
+LC_1mo_2mo <- mutate(LC_1mo_2mo, class = if_else(is.na(class), "DE in just one and not exp in other", class))
+LC_1mo_2mo$class <- factor(LC_1mo_2mo$class, levels = c("DE in just one and not exp in other", "DE in 1mo", "DE in 2mo", "DE in both"))
+LC_1mo_2mo <- mutate(LC_1mo_2mo, rep_spec = if_else(Gene %in% LC_1mo_nonDE_genes, "rep_spec_1mo", "non_rep_spec"))
+LC_1mo_2mo <- mutate(LC_1mo_2mo, rep_spec = if_else(Gene %in% LC_2mo_nonDE_genes, "rep_spec_2mo", rep_spec))
+LC_1mo_2mo <- arrange(LC_1mo_2mo, class)
+LC_1mo_2mo <- left_join(LC_1mo_2mo, SHSY5Y_aSyn_reg_genes_df)
+LC_1mo_2mo[is.na(LC_1mo_2mo$nDS), "nDS"] <- 0
+LC_1mo_2mo <- left_join(LC_1mo_2mo, HumanGenes_SN_LC_de_res, by = c("Gene" = "MOUSE_SYMBOL"))
+LC_1mo_2mo <- mutate(LC_1mo_2mo, othol = if_else(is.na(LC_1mo_2mo$HGNC_SYMBOL), 0.5, 0))
+saveRDS(HumanGenes_SN_LC_de_res, "Outputs/HumanGenes_SN_LC_de_res.rds")
+
+LC_1mo_2mo_plot <- ggplot(LC_1mo_2mo, aes(x= log2FC.1mo, y= log2FC.2mo, label = Gene, 
+                                          text = paste("Gene: ", Gene, "<br>", rep_spec,
+                                                       "<br>", DS),
+                                          fill = class, alpha = rep_spec, stroke = othol,
+                                          size = nDS)) + geom_point(shape = 21, color = "orange") + 
+  geom_text_repel(max.overlaps = 40) +
+  scale_alpha_manual(values = c("non_rep_spec" = 1, "rep_spec_1mo" = 0.5, "rep_spec_2mo" = 0.5)) + 
+  scale_fill_manual(values = c("DE in both" = "salmon", "DE in 1mo" = "lightgreen", "DE in 2mo" = "darkgreen", "DE in just one and not exp in other" = "cornflowerblue")) + 
+  scale_y_continuous(breaks = seq(-20, 5, by = 1)) +
+  scale_x_continuous(breaks = seq(-5, 20, by = 1)) +
+  labs(title = "LC 2mo vs 1mo")
+ggplotly(LC_1mo_2mo_plot, tooltip = "text", width = plotly_width, height = plotly_height)
+
+LC_SN_1mo_1mo <- full_join(LC_1mo, SN_1mo, by = "Gene", suffix = c(".LC", ".SN"))
+LC_SN_1mo_1mo <- mutate_if(LC_SN_1mo_1mo, grepl("log2FC", names(LC_SN_1mo_1mo)), function(x) ifelse(is.na(x), 0, x)) %>%  dplyr::select("log2FC.LC", "log2FC.SN", "Gene", "pvalue.LC", "pvalue.SN")
+LC_SN_1mo_1mo <- filter(LC_SN_1mo_1mo, (pvalue.LC <= 0.05 | pvalue.SN <= 0.05) )
+LC_SN_1mo_1mo <- mutate(LC_SN_1mo_1mo, class = if_else(pvalue.LC <= 0.05 & pvalue.SN <= 0.05, "DE in both", "DE in just one"))
+LC_SN_1mo_1mo <- mutate(LC_SN_1mo_1mo, class = if_else(pvalue.LC <= 0.05 & pvalue.SN > 0.05, "DE in LC 1mo", class))
+LC_SN_1mo_1mo <- mutate(LC_SN_1mo_1mo, class = if_else(pvalue.LC > 0.05 & pvalue.SN <= 0.05, "DE in SN 1mo", class))
+LC_SN_1mo_1mo <- mutate(LC_SN_1mo_1mo, class = if_else(is.na(class), "DE in just one and not exp in other", class))
+LC_SN_1mo_1mo$class <- factor(LC_SN_1mo_1mo$class, levels = c("DE in just one and not exp in other", "DE in LC 1mo", "DE in SN 1mo", "DE in both"))
+LC_SN_1mo_1mo <- mutate(LC_SN_1mo_1mo, rep_spec = if_else(Gene %in% LC_1mo_nonDE_genes, "rep_spec_1mo", "non_rep_spec"))
+LC_SN_1mo_1mo <- arrange(LC_SN_1mo_1mo, class)
+LC_SN_1mo_1mo <- left_join(LC_SN_1mo_1mo, SHSY5Y_aSyn_reg_genes_df)
+LC_SN_1mo_1mo[is.na(LC_SN_1mo_1mo$nDS), "nDS"] <- 0
+LC_SN_1mo_1mo <- left_join(LC_SN_1mo_1mo, HumanGenes_SN_LC_de_res, by = c("Gene" = "MOUSE_SYMBOL"))
+LC_SN_1mo_1mo <- mutate(LC_SN_1mo_1mo, othol = if_else(is.na(LC_SN_1mo_1mo$HGNC_SYMBOL), 0.5, 0))
+saveRDS(LC_SN_1mo_1mo, "Outputs/240702_LC_SN_1mo_1mo_table_same_criteria.rds")
+
+
+LC_SN_1mo_1mo_plot <- ggplot(LC_SN_1mo_1mo, aes(x= log2FC.LC, y= log2FC.SN, label = Gene,
+                                          text = paste("Gene: ", Gene, "<br>", rep_spec,
+                                                       "<br>", DS),
+                                          fill = class, alpha = rep_spec, stroke = othol,
+                                          size = nDS)) + geom_point(shape = 21, color = "orange") + 
+  geom_text_repel(max.overlaps = 20) +
+  scale_alpha_manual(values = c("non_rep_spec" = 1, "rep_spec_1mo" = 0.5)) + 
+  scale_fill_manual(values = c("DE in both" = "salmon", "DE in LC 1mo" = "lightgreen", "DE in SN 1mo" = "darkgreen", "DE in just one and not exp in other" = "cornflowerblue")) + 
+  scale_y_continuous(breaks = seq(-3, 3, by = 1)) +
+  scale_x_continuous(breaks = seq(-5, 20, by = 1)) +
+  labs(title = "SN 1mo vs LC 1mo")
+ggplotly(LC_SN_1mo_1mo_plot, tooltip = "text", width = plotly_width, height = plotly_height)
+
+LC_SN_2mo_1mo <- full_join(LC_2mo, SN_1mo, by = "Gene", suffix = c(".LC", ".SN"))
+LC_SN_2mo_1mo <- mutate_if(LC_SN_2mo_1mo, grepl("log2FC", names(LC_SN_2mo_1mo)), function(x) ifelse(is.na(x), 0, x)) %>%  dplyr::select("log2FC.LC", "log2FC.SN", "Gene", "pvalue.LC", "pvalue.SN")
+LC_SN_2mo_1mo <- filter(LC_SN_2mo_1mo, (pvalue.LC <= 0.05 | pvalue.SN <= 0.05) )
+LC_SN_2mo_1mo <- mutate(LC_SN_2mo_1mo, class = if_else(pvalue.LC <= 0.05 & pvalue.SN <= 0.05, "DE in both", "DE in just one"))
+LC_SN_2mo_1mo <- mutate(LC_SN_2mo_1mo, class = if_else(pvalue.LC <= 0.05 & pvalue.SN > 0.05, "DE in LC 2mo", class))
+LC_SN_2mo_1mo <- mutate(LC_SN_2mo_1mo, class = if_else(pvalue.LC > 0.05 & pvalue.SN <= 0.05, "DE in SN 1mo", class))
+LC_SN_2mo_1mo <- mutate(LC_SN_2mo_1mo, class = if_else(is.na(class), "DE in just one and not exp in other", class))
+LC_SN_2mo_1mo$class <- factor(LC_SN_2mo_1mo$class, levels = c("DE in just one and not exp in other", "DE in LC 2mo", "DE in SN 1mo", "DE in both"))
+LC_SN_2mo_1mo <- mutate(LC_SN_2mo_1mo, rep_spec = if_else(Gene %in% LC_2mo_nonDE_genes, "rep_spec_2mo", "non_rep_spec"))
+LC_SN_2mo_1mo <- arrange(LC_SN_2mo_1mo, class)
+LC_SN_2mo_1mo <- left_join(LC_SN_2mo_1mo, SHSY5Y_aSyn_reg_genes_df)
+LC_SN_2mo_1mo[is.na(LC_SN_2mo_1mo$nDS), "nDS"] <- 0
+LC_SN_2mo_1mo <- left_join(LC_SN_2mo_1mo, HumanGenes_SN_LC_de_res, by = c("Gene" = "MOUSE_SYMBOL"))
+LC_SN_2mo_1mo <- mutate(LC_SN_2mo_1mo, othol = if_else(is.na(LC_SN_2mo_1mo$HGNC_SYMBOL), 0.5, 0))
+saveRDS(LC_SN_2mo_1mo, "Outputs/240702_LC_SN_2mo_1mo_table_same_criteria.rds")
+
+
+LC_SN_2mo_1mo_plot <- ggplot(LC_SN_2mo_1mo, aes(x= log2FC.LC, y= log2FC.SN, label = Gene, 
+                                          text = paste("Gene: ", Gene, "<br>", rep_spec,
+                                                       "<br>", DS),
+                                          fill = class, alpha = rep_spec, stroke = othol,
+                                          size = nDS)) + geom_point(shape = 21, color = "orange") + 
+  geom_text_repel(max.overlaps = 20) +
+  scale_alpha_manual(values = c("non_rep_spec" = 1, "rep_spec_2mo" = 0.5)) + 
+  scale_fill_manual(values = c("DE in both" = "salmon", "DE in LC 2mo" = "lightgreen", "DE in SN 1mo" = "darkgreen", "DE in just one and not exp in other" = "cornflowerblue")) + 
+  scale_y_continuous(breaks = seq(-3, 3, by = 1)) +
+  scale_x_continuous(breaks = seq(-20, 5, by = 1)) +
+  labs(title = "SN 1mo vs LC 2mo")
+ggplotly(LC_SN_2mo_1mo_plot, tooltip = "text", width = plotly_width, height = plotly_height)
+
+
+LC_SN_1mo_2mo <- full_join(LC_1mo, SN_2mo, by = "Gene", suffix = c(".LC", ".SN"))
+LC_SN_1mo_2mo <- mutate_if(LC_SN_1mo_2mo, grepl("log2FC", names(LC_SN_1mo_2mo)), function(x) ifelse(is.na(x), 0, x)) %>%  dplyr::select("log2FC.LC", "log2FC.SN", "Gene", "pvalue.LC", "pvalue.SN")
+LC_SN_1mo_2mo <- filter(LC_SN_1mo_2mo, (pvalue.LC <= 0.05 | pvalue.SN <= 0.05) )
+LC_SN_1mo_2mo <- mutate(LC_SN_1mo_2mo, class = if_else(pvalue.LC <= 0.05 & pvalue.SN <= 0.05, "DE in both", "DE in just one"))
+LC_SN_1mo_2mo <- mutate(LC_SN_1mo_2mo, class = if_else(pvalue.LC <= 0.05 & pvalue.SN > 0.05, "DE in LC 1mo", class))
+LC_SN_1mo_2mo <- mutate(LC_SN_1mo_2mo, class = if_else(pvalue.LC > 0.05 & pvalue.SN <= 0.05, "DE in SN 1mo", class))
+LC_SN_1mo_2mo <- mutate(LC_SN_1mo_2mo, class = if_else(is.na(class), "DE in just one and not exp in other", class))
+LC_SN_1mo_2mo$class <- factor(LC_SN_1mo_2mo$class, levels = c("DE in just one and not exp in other", "DE in LC 1mo", "DE in SN 1mo", "DE in both"))
+LC_SN_1mo_2mo <- mutate(LC_SN_1mo_2mo, rep_spec = if_else(Gene %in% LC_1mo_nonDE_genes, "rep_spec_1mo", "non_rep_spec"))
+LC_SN_1mo_2mo <- arrange(LC_SN_1mo_2mo, class)
+LC_SN_1mo_2mo <- left_join(LC_SN_1mo_2mo, SHSY5Y_aSyn_reg_genes_df)
+LC_SN_1mo_2mo[is.na(LC_SN_1mo_2mo$nDS), "nDS"] <- 0
+LC_SN_1mo_2mo <- left_join(LC_SN_1mo_2mo, HumanGenes_SN_LC_de_res, by = c("Gene" = "MOUSE_SYMBOL"))
+LC_SN_1mo_2mo <- mutate(LC_SN_1mo_2mo, othol = if_else(is.na(LC_SN_1mo_2mo$HGNC_SYMBOL), 0.5, 0))
+
+saveRDS(LC_SN_1mo_2mo, "Outputs/240702_LC_SN_1mo_2mo_table_same_criteria.rds")
+
+
+LC_SN_1mo_2mo_plot <- ggplot(LC_SN_1mo_2mo, aes(x= log2FC.LC, y= log2FC.SN, label = Gene,
+                                          text = paste("Gene: ", Gene, "<br>", rep_spec,
+                                                       "<br>", DS),
+                                          fill = class, alpha = rep_spec, stroke = othol,
+                                          size = nDS)) + geom_point(shape = 21, color = "orange") + 
+  geom_text_repel(max.overlaps = 20) +
+  scale_alpha_manual(values = c("non_rep_spec" = 1, "rep_spec_1mo" = 0.5)) + 
+  scale_fill_manual(values = c("DE in both" = "salmon", "DE in LC 1mo" = "lightgreen", "DE in SN 1mo" = "darkgreen", "DE in just one and not exp in other" = "cornflowerblue")) + 
+  scale_y_continuous(breaks = seq(-3, 3, by = 1)) +
+  scale_x_continuous(breaks = seq(-5, 20, by = 1)) +
+  labs(title = "SN 2mo vs LC 1mo")
+ggplotly(LC_SN_1mo_2mo_plot, tooltip = "text", width = plotly_width, height = plotly_height)
+
+LC_SN_2mo_2mo <- full_join(LC_2mo, SN_2mo, by = "Gene", suffix = c(".LC", ".SN"))
+LC_SN_2mo_2mo <- mutate_if(LC_SN_2mo_2mo, grepl("log2FC", names(LC_SN_2mo_2mo)), function(x) ifelse(is.na(x), 0, x)) %>%  dplyr::select("log2FC.LC", "log2FC.SN", "Gene", "pvalue.LC", "pvalue.SN")
+LC_SN_2mo_2mo <- filter(LC_SN_2mo_2mo, (pvalue.LC <= 0.05 | pvalue.SN <= 0.05) )
+LC_SN_2mo_2mo <- mutate(LC_SN_2mo_2mo, class = if_else(pvalue.LC <= 0.05 & pvalue.SN <= 0.05, "DE in both", "DE in just one"))
+LC_SN_2mo_2mo <- mutate(LC_SN_2mo_2mo, class = if_else(pvalue.LC <= 0.05 & pvalue.SN > 0.05, "DE in LC 2mo", class))
+LC_SN_2mo_2mo <- mutate(LC_SN_2mo_2mo, class = if_else(pvalue.LC > 0.05 & pvalue.SN <= 0.05, "DE in SN 1mo", class))
+LC_SN_2mo_2mo <- mutate(LC_SN_2mo_2mo, class = if_else(is.na(class), "DE in just one and not exp in other", class))
+LC_SN_2mo_2mo$class <- factor(LC_SN_2mo_2mo$class, levels = c("DE in just one and not exp in other", "DE in LC 2mo", "DE in SN 1mo", "DE in both"))
+LC_SN_2mo_2mo <- mutate(LC_SN_2mo_2mo, rep_spec = if_else(Gene %in% LC_2mo_nonDE_genes, "rep_spec_2mo", "non_rep_spec"))
+LC_SN_2mo_2mo <- arrange(LC_SN_2mo_2mo, class)
+LC_SN_2mo_2mo <- left_join(LC_SN_2mo_2mo, SHSY5Y_aSyn_reg_genes_df)
+LC_SN_2mo_2mo[is.na(LC_SN_2mo_2mo$nDS), "nDS"] <- 0
+LC_SN_2mo_2mo <- left_join(LC_SN_2mo_2mo, HumanGenes_SN_LC_de_res, by = c("Gene" = "MOUSE_SYMBOL"))
+LC_SN_2mo_2mo <- mutate(LC_SN_2mo_2mo, othol = if_else(is.na(LC_SN_2mo_2mo$HGNC_SYMBOL), 0.5, 0))
+
+saveRDS(LC_SN_2mo_2mo, "Outputs/240702_LC_SN_2mo_2mo_table_same_criteria.rds")
+
+
+LC_SN_2mo_2mo_plot <- ggplot(LC_SN_2mo_2mo, aes(x= log2FC.LC, y= log2FC.SN, label = Gene, 
+                                          text = paste("Gene: ", Gene, "<br>", rep_spec,
+                                                       "<br>", DS),
+                                          fill = class, alpha = rep_spec, stroke = othol,
+                                          size = nDS)) + geom_point(shape = 21, color = "orange") + 
+  geom_text_repel(max.overlaps = 20) +
+  scale_alpha_manual(values = c("non_rep_spec" = 1, "rep_spec_2mo" = 0.5)) + 
+  scale_fill_manual(values = c("DE in both" = "salmon", "DE in LC 2mo" = "lightgreen", "DE in SN 1mo" = "darkgreen", "DE in just one and not exp in other" = "cornflowerblue")) + 
+  scale_y_continuous(breaks = seq(-3, 3, by = 1)) +
+  scale_x_continuous(breaks = seq(-20, 5, by = 1)) +
+  labs(title = "SN 2mo vs LC 2mo")
+ggplotly(LC_SN_2mo_2mo_plot, tooltip = "text", width = plotly_width, height = plotly_height)
+
+
+```
+
+Ppib: The protein encoded by this gene is a cyclosporine-binding protein and is mainly located within the endoplasmic reticulum. It is associated with the secretory pathway and released in biological fluids. This protein can bind to cells derived from T- and B-lymphocytes, and may regulate cyclosporine A-mediated immunosuppression. Variants have been identified in this protein that give rise to recessive forms of osteogenesis imperfecta. (GeneCards)
+
+Pdia3: This gene encodes a protein of the endoplasmic reticulum that interacts with lectin chaperones calreticulin and calnexin to modulate folding of newly synthesized glycoproteins. The protein was once thought to be a phospholipase; however, it has been demonstrated that the protein actually has protein disulfide isomerase activity. It is thought that complexes of lectins and this protein mediate protein folding by promoting formation of disulfide bonds in their glycoprotein substrates. This protein also functions as a molecular chaperone that prevents the formation of protein aggregates. (GeneCards)
+
+Pcdh9: This gene encodes a member of the protocadherin family, and cadherin superfamily, of transmembrane proteins containing cadherin domains. These proteins mediate cell adhesion in neural tissues in the presence of calcium. The encoded protein may be involved in signaling at neuronal synaptic junctions. Sharing a characteristic with other protocadherin genes, this gene has a notably large exon that encodes multiple cadherin domains and a transmembrane region. Alternatively spliced transcript variants encoding distinct isoforms have been found for this gene. (GeneCards)
+
+Ube3a: This gene encodes an E3 ubiquitin-protein ligase, part of the ubiquitin protein degradation system. This imprinted gene is maternally expressed in brain and biallelically expressed in other tissues. Maternally inherited deletion of this gene causes Angelman Syndrome, characterized by severe motor and intellectual retardation, ataxia, hypotonia, epilepsy, absence of speech, and characteristic facies. The protein also interacts with the E6 protein of human papillomavirus types 16 and 18, resulting in ubiquitination and proteolysis of tumor protein p53. Alternative splicing of this gene results in three transcript variants encoding three isoforms with different N-termini. Additional transcript variants have been described, but their full length nature has not been determined. (GeneCards)
+
+Oxr1: Predicted to enable oxidoreductase activity. Predicted to be involved in response to oxidative stress. Predicted to act upstream of or within several processes, including adult walking behavior; negative regulation of neuron death; and negative regulation of peptidyl-cysteine S-nitrosylation. Predicted to be located in mitochondrion and nucleolus. Predicted to be active in nucleus. Implicated in cerebellar hyplasia/atrophy, epilepsy, and global developmental delay. (GeneCards)
+
+Gabrg2: This gene encodes a gamma-aminobutyric acid (GABA) receptor. GABA is the major inhibitory neurotransmitter in the mammlian brain, where it acts at GABA-A receptors, which are ligand-gated chloride channels. GABA-A receptors are pentameric, consisting of proteins from several subunit classes: alpha, beta, gamma, delta and rho. Mutations in this gene have been associated with epilepsy and febrile seizures. Multiple transcript variants encoding different isoforms have been identified for this gene. (GeneCards)
+
+Saraf: Involved in regulation of store-operated calcium entry. Located in endoplasmic reticulum and endoplasmic reticulum-plasma membrane contact site. Is integral component of endoplasmic reticulum membrane. (GeneCards)
+
+Slc22a17: Predicted to enable transmembrane signaling receptor activity. Predicted to be involved in siderophore transport. Is integral component of organelle membrane and integral component of plasma membrane. (GeneCards)
+
+Serinc1: Predicted to enable protein-macromolecule adaptor activity. Predicted to be involved in several processes, including phosphatidylserine metabolic process; positive regulation of CDP-diacylglycerol-serine O-phosphatidyltransferase activity; and positive regulation of serine C-palmitoyltransferase activity. Predicted to be located in endoplasmic reticulum membrane and plasma membrane. Predicted to be active in membrane. (GeneCards)
+
+\-\-\-\-\--
+
+Lmo3: The protein encoded by this gene belongs to the rhombotin family of cysteine-rich LIM domain oncogenes. This gene is predominantly expressed in the brain. Related family members, LMO1 and LMO2 on chromosome 11, have been reported to be involved in chromosomal translocations in T-cell leukemia. Many alternatively spliced transcript variants have been found for this gene. (GeneCards)
+
+Ptpn4: The protein encoded by this gene is a member of the protein tyrosine phosphatase (PTP) family. PTPs are known to be signaling molecules that regulate a variety of cellular processes including cell growth, differentiation, mitotic cycle, and oncogenic transformation. This protein contains a C-terminal PTP domain and an N-terminal domain homologous to the band 4.1 superfamily of cytoskeletal-associated proteins. This PTP has been shown to interact with glutamate receptor delta 2 and epsilon subunits, and is thought to play a role in signalling downstream of the glutamate receptors through tyrosine dephosphorylation. (GeneCards)
+
+Pcdh15: This gene is a member of the cadherin superfamily. Family members encode integral membrane proteins that mediate calcium-dependent cell-cell adhesion. It plays an essential role in maintenance of normal retinal and cochlear function. Mutations in this gene result in hearing loss and Usher Syndrome Type IF (USH1F). Extensive alternative splicing resulting in multiple isoforms has been observed in the mouse ortholog. Similar alternatively spliced transcripts are inferred to occur in human, and additional variants are likely to occur. (GeneCards)
+
+Frmd4b: This gene encodes a GRP1-binding protein which contains a FERM protein interaction domain as well as two coiled coil domains. This protein may play a role as a scaffolding protein. (GeneCards)
+
+Pde10a: The protein encoded by this gene belongs to the cyclic nucleotide phosphodiesterase family. It plays a role in signal transduction by regulating the intracellular concentration of cyclic nucleotides. This protein can hydrolyze both cAMP and cGMP to the corresponding nucleoside 5' monophosphate, but has higher affinity for cAMP, and is more efficient with cAMP as substrate. Alternatively spliced transcript variants have been described for this gene. (GeneCards)
+
+

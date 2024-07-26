@@ -1,0 +1,1427 @@
+---
+title: "QC Analysis and Integration 3rd and 4th DataSet"
+author: "Camila Arcuschin; Ignacio Schor"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    self_contained: true
+    theme: cerulean
+    code_folding: hide
+    bibliography: references.bib
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, message = FALSE, warning = FALSE, dpi=500, cache=F, dev = c('png', 'pdf')) #dev = c('pdf', 'png') # If I want to export plots but don't look to the html (because it is too heavy). Remember to also add: clean = FALSE, as a parameter of the rmarkdown::render() function, when executing 
+knitr::opts_knit$set(root.dir = "/data_husihuilke/shared/SMB/carcu/Parkinsons_project/")
+```
+
+```{r importpckg, include=FALSE}
+library(Seurat)
+library(tidyverse)
+library(hdf5r)
+library(pryr)
+library(gridExtra)
+library(grid)
+library(ragg) # scaling plots
+library(reticulate)
+library(patchwork)
+library(cowplot)
+library(future)
+library(htmltools)
+library(DT)
+library(ComplexHeatmap)
+library(colorRamp2)
+library(MAST)
+plan(multisession, workers = 6)
+#plan("multiprocess", workers = 6)
+options(future.globals.maxSize = 4000 * 1024^2)
+```
+
+There are some warnings. Check them later
+
+```{r Functions, include =FALSE}
+#### Functions ####
+
+# Create Seurat Object and filter by UMIs.p.cell and ribosomal percentage
+Seu_filter<- function(dataX, UMIs.p.cell_lth, UMIs.p.cell_hth, percent.rb_th, treatment){
+  # Implement some filter parameters to avoid working with a very big matrix
+  # Gene must be expressed in at least 30 cell (of the 2452867 "cells")
+  # Explore the data, rename the cells metadata
+  GetAssayData(dataX)
+  dataX[[]] %>% str()
+  dataX@meta.data <- rename(dataX@meta.data, "ActiveGenes.p.cell" = "nFeature_RNA")
+  dataX@meta.data <- mutate(dataX@meta.data, "UMIs.p.cell" = nCount_RNA)
+  #Add MetaData
+  is.ribo<-lapply(c("Rpl", "Rps"), function(x) grepl(x, rownames(dataX))) %>% unlist()
+  ribo_genes<-lapply(c("Rpl", "Rps"), function(x) grep(x, rownames(dataX), value = T)) %>% unlist()
+  ribo_umis <- subset(dataX, features = ribo_genes) %>% GetAssayData() %>% colSums()
+  dataX[["percent.rb"]] <- 100*ribo_umis/dataX$UMIs.p.cell
+  dataX[["percent.mt"]] <- PercentageFeatureSet(dataX, pattern = "Mt")
+  # What would happen if I only kept the cell with more than 2000 UMIs (aprox remove the 7% of the distribution)
+  dataX <- subset(dataX, subset = UMIs.p.cell > UMIs.p.cell_lth & UMIs.p.cell < UMIs.p.cell_hth & percent.rb < percent.rb_th)
+  return(dataX)
+}
+
+get_legend<-function(myggplot){
+  tmp <- ggplot_gtable(ggplot_build(myggplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)
+}
+
+# Log Normalize Seurat and select the 2000 most variable genes
+norm_seurat<- function(all_samples) {
+  all_samples <- NormalizeData(all_samples, normalization.method = "LogNormalize", scale.factor = 10000)
+  all_samples <- FindVariableFeatures(all_samples, selection.method = "vst", nfeatures = 2000, loess.span = 0.6)
+}
+
+# Run PCA, knn and UMAP
+UMAP_maker<-function(obj, dims, k.param){
+  ScaleData(object = obj) %>%
+    RunPCA(npcs = dims) %>%
+    FindNeighbors(dims = 1:dims, k.param = k.param) %>% #Esta linea no har?a falta, igual creo que no cambiar?a nada porque siempre lo estoy pisando.
+    RunUMAP(dims = 1:dims)
+} # The reason why I have FindNeighbours here is because, if I want to replot UMAP whithout changing the cluster already assigned, I could do it
+
+preprocess_RPCA <- function(obj.list, features) {
+  obj.list<-ScaleData(object = obj.list, features = features) %>%
+    RunPCA(features = features)
+}
+
+fisher<-function(x){
+  matriz<-matrix(c(x[1], x[2], x[3], x[4]), nrow = 2)
+  f_test<-fisher.test(matriz, alternative = "greater")
+  data_fisher<-c(enrich = f_test[["estimate"]][["odds ratio"]], p_val = f_test[["p.value"]], conf_int = f_test[["conf.int"]])
+  return(data_fisher)
+}
+
+create_random <- function(To, p_E, p_S, p_N){
+  vec <- sample(c("EGFP", "SNCA", "EGFP_SNCA", "Neith"), To,  replace = T, prob = c(p_E-p_E*p_S, p_S-p_E*p_S, p_E*p_S, p_N))
+  table(vec)
+}
+
+EGFP_SNCA <- function(df){
+  nrow(filter(df, EGFP == "1" & hSNCA == "1" ))
+}
+
+EGFP <- function(df){
+  nrow(filter(df, EGFP == "1" & hSNCA == "0" ))
+}
+
+SNCA <- function(df){
+  nrow(filter(df, EGFP == "0" & hSNCA == "1" ))
+}
+
+Neith <- function(df){
+  nrow(filter(df, EGFP == "0" & hSNCA == "0" ))
+}
+
+label2analyze <- function(FishTest){
+  vect <- c()
+  for (i in 1:length(clusters2analyze)){
+    if (i != 3){
+      vect[i] <- paste0("Cluster ", clusters2analyze[i], " = ", round(FishTest["enrich", clusters2analyze[i]], 2), " (p-adj = ", format(FishTest["FDR", clusters2analyze[i]], digits=3), ") ; ")
+    } else {
+      vect[i] <- paste0("Cluster ", clusters2analyze[i], " = ", round(FishTest["enrich", clusters2analyze[i]], 2), " (p-adj = ", format(FishTest["FDR", clusters2analyze[i]], digits=3), ") ;\n")
+    }
+  }
+  return(vect)
+}
+
+explore_conditional_or <- function(x){
+  matriz<-array(c(x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8]), dim = c(2,2,2))
+  return(apply(matriz, 3, function(x) (x[1,1]*x[2,2])/(x[1,2]*x[2,1])))
+}
+
+woolf <- function(x) {
+  x <- x + 1 / 2
+  k <- dim(x)[3]
+  or <- apply(x, 3, function(x) (x[1,1]*x[2,2])/(x[1,2]*x[2,1]))
+  w <-  apply(x, 3, function(x) 1 / sum(1 / x))
+  1 - pchisq(sum(w * (log(or) - weighted.mean(log(or), w)) ^ 2), k - 1)
+}
+
+woolf_test <- function(x){
+  matriz<-array(c(x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8]), dim = c(2,2,2))
+  return(woolf(matriz))
+}
+
+mantel_haenszel<-function(x){
+  matriz<-array(c(x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8]), dim = c(2,2,2))
+  f_test<-mantelhaen.test(matriz, alternative = "greater")
+  data_mantel_haenszel<-c(enrich = f_test[["estimate"]][["common odds ratio"]], p_val = f_test[["p.value"]], conf_int = f_test[["conf.int"]])
+  return(data_mantel_haenszel)
+}
+
+# Plotting
+my_theme <- theme_classic() +
+  theme(plot.title = element_text(size = 25, face = "bold"),
+        axis.text.x = element_text(colour = "black", size = 14),
+        axis.text.y = element_text(colour = "black", size = 14),
+        legend.title = element_text(size = 15),
+        legend.text = element_text(size = 15),
+        axis.title.y = element_text(size = 15),
+        axis.title.x = element_text(size = 15),
+        strip.text.x = element_text(size = 15))
+
+QC_plots <- function(SeuObj, extra_text, n_color) {
+  Dist_QC <-
+    VlnPlot(
+      SeuObj,
+      features = c(
+        "ActiveGenes.p.cell",
+        "UMIs.p.cell",
+        "percent.mt",
+        "percent.rb"
+      ),
+      ncol = 4,
+      pt.size = 0,
+      cols = n_color
+    ) &
+    theme(legend.position = "none",
+          axis.title = element_text(size = 6),
+          axis.text = element_text(size = 5),
+          plot.title = element_text(size = 8, face = "bold"))
+  stth <-     theme(
+    legend.position = "none",
+    axis.title = element_text(size = 6),
+    axis.text = element_text(size = 5),
+    plot.title = element_text(size = 8, face = "bold")
+  )
+  plot1 <-
+    FeatureScatter(
+      SeuObj,
+      feature1 = "UMIs.p.cell",
+      feature2 = "percent.mt",
+      pt.size = 0.5,
+      plot.cor =  F,
+      cols = n_color,
+      cells = sample(Cells(SeuObj))
+    ) + stth
+  plot2 <-
+    FeatureScatter(
+      SeuObj,
+      feature1 = "UMIs.p.cell",
+      feature2 = "ActiveGenes.p.cell",
+      pt.size = 0.5,
+      plot.cor =  F,
+      cols = n_color,
+      cells = sample(Cells(SeuObj))
+    ) + stth
+  plot3 <-
+    FeatureScatter(
+      SeuObj,
+      feature1 = "ActiveGenes.p.cell",
+      feature2 = "percent.rb",
+      pt.size = 0.5,
+      plot.cor =  F,
+      cols = n_color,
+      cells = sample(Cells(SeuObj))
+    )+ stth
+  plot4 <-
+    FeatureScatter(
+      SeuObj,
+      feature1 = "UMIs.p.cell",
+      feature2 = "percent.rb",
+      pt.size = 0.5,
+      plot.cor =  F,
+      cols = n_color,
+      cells = sample(Cells(SeuObj))
+    ) + stth
+  Scat_QC <-
+    plot_grid(plot1, plot2, plot3, plot4, nrow = 1)
+  QC_plot <- (Dist_QC/Scat_QC) +
+    plot_annotation(
+      title = paste0(
+        extra_text,
+        "Quality Control Metrics for > ",
+        UMIs.p.cell_lowthreshold,
+        " <",
+        UMIs.p.cell_highthreshold,
+        " UMI < ",
+        percent.rb_threshold,
+        " per.rb Matrix (",
+        dim(SeuObj)[2],
+        " Cells)"
+      ),
+      subtitle = "each number is a cluster",
+      theme = theme(
+        axis.text = element_text(size = 5),
+        axis.title = element_text(size = 6),
+        plot.title = element_text(size = 6, face = "bold")
+      )
+    )
+  return(QC_plot)
+}
+
+UMAP_by_clust <-
+  function(SeuObj,
+           ClusterBreaks,
+           ClusterLabels,
+           pt_size,
+           title_text,
+           subtitle_text,
+           color_a,
+           color_b,
+           do_label,
+           n_color) {
+    (
+      UMAPa <-
+        DimPlot(
+          SeuObj,
+          reduction = "umap",
+          label = do_label,
+          pt.size = pt_size
+        ) +
+         scale_colour_manual(values = n_color, breaks = ClusterBreaks, labels = ClusterLabels) +
+        labs(
+          title = title_text,
+          subtitle = subtitle_text
+          # color = color_a
+        ) +
+        theme(
+          axis.title = element_text(size = 6),
+          legend.title = element_text(size = 6),
+          legend.text = element_text(size = 6),
+          legend.position = "bottom",
+          plot.title = element_text(size = 10, face = "bold"), axis.text = element_text(size = 0), axis.ticks = element_line(size = 0)
+        ) +
+        guides(color = guide_legend(
+          title.position="top",
+          override.aes = list(size = 1), nrow = 3
+        ))
+    )
+    (
+      UMAPb <-
+        DimPlot(
+          SeuObj,
+          reduction = "umap",
+          label = F,
+          pt.size = pt_size,
+          group.by = "Treat",
+          cells = sample(Cells(SeuObj))
+        ) +
+        labs(
+          title = "",
+          subtitle = "",
+          color = color_b
+        ) +
+        theme(
+          legend.position = "right",
+          axis.title = element_text(size = 6),
+          legend.title = element_text(size = 6),
+          legend.text = element_text(size = 6),
+          plot.title = element_text(size = 10, face = "bold"), axis.text = element_text(size = 0), axis.ticks = element_line(size = 0)
+        ) +
+        guides(color = guide_legend(
+          override.aes = list(size = 1), nrow = 2
+        ))
+    )
+    return(list("UMAPa" = UMAPa, "UMAPb" = UMAPb))
+  }
+
+
+insert_minor <- function(major_labs, n_minor) {labs <- 
+  c( sapply( major_labs, function(x) c(x, rep("", 4) ) ) )
+labs[1:(length(labs)-n_minor)]}
+
+UMAPs_for_grid <- function(SeuObj, subtitle_text){
+  Idents(SeuObj) <- "Genes"
+  UMAP4 <- DimPlot(SeuObj, reduction = "umap", order = T, label = F, pt.size = 1, label.size = 8, ncol = 1, cols = c("grey","#40a1e4", "#e48340", "#4c0e97")) +
+    labs(title = "", subtitle = "EGFP-KASH+ hSNCA-A53T+ Cells") + theme(legend.position = "top", axis.text = element_text(size = 0), axis.ticks = element_line(size = 0)) + 
+    guides(color = guide_legend(override.aes = list(size=4), nrow=1))
+  legend <- get_legend(UMAP4)
+  UMAP4 <- UMAP4 + theme(legend.position = "none")
+  Idents(SeuObj) <- "seurat_clusters"
+  UMAPa<-DimPlot(SeuObj, reduction = "umap", pt.size = 0.7, label = F, cols = colors_n) + theme(legend.position = "none", axis.text = element_text(size = 0), axis.ticks = element_line(size = 0))
+  UMAPa_edit <- LabelClusters(UMAPa, id= "ident", size=4, repel = F) + labs(title = "", subtitle = subtitle_text) +
+    theme(title = element_text(size = 15))
+  return(list("UMAP4_split" = UMAP4, "UMAPa_edit" = UMAPa_edit, "UMAP4_legend" = legend))
+}
+
+FeaturePlotMultiple2<- function(obj, feature, color, ord, alf, minlim){
+  # # the minimal and maximal of the value to make the legend scale the same. 
+  # minimal<- min(obj[['RNA']]@data[feature, ])
+  # maximal<- max(obj[['RNA']]@data[feature, ])
+  ps<- vector("list", length(feature))
+  for (i in 1:length(feature)) {
+    if (ord){
+      p<- FeaturePlot(obj, features = feature[i], min.cutoff = minlim, max.cutoff = "q90", pt.size = 0.00001, cols = c(alpha("lightgrey", alf), alpha(color[i], alf)), order = T) 
+    } else {
+      p<- FeaturePlot(obj, features = feature[i], min.cutoff = minlim, max.cutoff = "q90", pt.size = 0.00001, cols = c(alpha("lightgrey", alf), alpha(color[i], alf)), cells = sample(Cells(obj))) 
+    }
+    #ggtitle(feature[i]) + theme_void() +
+    p <- p + theme(text = element_text(size = 8), axis.text = element_text(size = 5), plot.title = element_text(size = 10, face = "bold"), legend.position = "none")
+    plot_name <- feature[i]
+    ps[[i]] <- p
+    names(ps)[[i]] <- plot_name
+  }
+  return(ps)
+}
+
+exp_cells<- function(x){
+  sum(x>0)
+}
+
+TryDifferentPCs <- function(SeuObj, colors_n, dims){
+UMAP.SeuObj <- DimPlot(SeuObj, group.by = "orig.ident", cells = sample(Cells(SeuObj))) + labs( subtitle = "") + theme_void(base_size = 10) 
+UMAP.SeuObja <- DimPlot(SeuObj, group.by = "seurat_clusters", order = T, label = T, cols = colors_n) + labs(title = "3rd") + theme_void(base_size = 10) + NoLegend() 
+print(plot_grid(UMAP.SeuObj, NULL, UMAP.SeuObja, NULL, ncol = 2, nrow = 2))
+
+plotl <- list()
+for (i in 1:length(dims)){
+SeuObj2 <- UMAP_maker(SeuObj, dims[i], 10)
+
+UMAP.SeuObj2 <- DimPlot(SeuObj2, group.by = "orig.ident", cells = sample(Cells(SeuObj2))) + labs( subtitle = "") + theme_void(base_size = 10) 
+colors_n <- rainbow(length(unique(SeuObj2@meta.data$seurat_clusters)))
+names(colors_n) <- unique(SeuObj2@meta.data$seurat_clusters)
+UMAP.SeuObj2a <- DimPlot(SeuObj2, group.by = "seurat_clusters", order = T, label = T, cols = colors_n) + labs(title = "3rd") + theme_void(base_size = 10) + NoLegend() 
+title <- ggdraw() + 
+  draw_label(paste0("dim = ", dims[i]))
+plotl[[i]] <- plot_grid(title,
+plot_grid(UMAP.SeuObj2, NULL, UMAP.SeuObj2a, NULL, ncol = 2, nrow = 2),
+ncol = 1, rel_heights = c(0.1, 1))
+}
+return(plotl)
+}
+
+
+MarkerPlot <- function(SeuObj){
+# Neuronal markers:
+Dopaminergic <- c("Th", "Slc6a3") #"Th": Dopamine synthesis enzyme "Slc6a3": #DopamineTransporter
+NoradrenalineTransporter <- "Slc6a5"
+GABAergic <-
+  c("Gad1", "Gad2") #"Gad1", "Gad2" : GABA synthesis enzymes
+Glutamatergic <-
+  c("Slc17a7", "Slc17a6", "Slc17a8") #"Slc17a7", "Slc17a6", "Slc17a8": Glutamate transporters
+Cholinergic <-
+  c("Slc18a3", "Slc5a7") #"Slc18a3", "Slc5a7": Acetylcholine transporters "Gm5741"?
+Noradrenergic <- "Dbh" 
+AmineTranporter <-
+  c("Slc18a2", "Vat1") #"Slc18a2": Monoamine transporter (dopamine, norepinephrine, serotonin, and histamine) #"Vat1": Vesicle amine transporter
+Serotoninergic <-
+  c("Tph1", "Htr1a", "Htr1b", "Htr1f", "Htr1d",  "Htr2c") #"Tph1": Serotonin synthesis enzyme  #"Htr1a", "Htr1b", "Htr1f", "Htr1d",  "Htr2c": Serotonin transporter
+AmineDegradetion <-
+  c("Comt", "Maoa", "Maob") #"Comt", "Maoa", "Maob": Amine degradetion
+
+# Plot neuronal markers on X DS
+# Plot neuronal markers
+DefaultAssay(SeuObj) <-
+  "RNA" # Th gene is not a variable feature in the INTE assay
+th <-
+  theme(
+    text = element_text(size = 8),
+    axis.text = element_text(size = 5),
+    plot.title = element_text(size = 10, face = "bold")
+  )
+plot1 <-
+  FeaturePlot(
+    SeuObj,
+    features = c(Dopaminergic, Noradrenergic, "EGFP-KASH"),
+    pt.size = 0.00001,
+    order =  T,
+    ncol = length(c(Dopaminergic, Noradrenergic, "EGFP-KASH"))
+  ) & th #normalized counts
+SeuObj@meta.data$Thg <-
+  ifelse(GetAssayData(SeuObj, slot = "counts")["Th", ] > 0, 1, 0) %>% as.factor()
+SeuObj@meta.data$Slc6a3g <-
+  ifelse(GetAssayData(SeuObj, slot = "counts")["Slc6a3", ] > 0, 1, 0) %>% as.factor()
+SeuObj@meta.data$Dbhg <-
+  ifelse(GetAssayData(SeuObj, slot = "counts")["Dbh", ] > 0, 1, 0) %>% as.factor()
+plot2 <- DimPlot(SeuObj, group.by = "Thg", order = T) + th
+plot3 <- DimPlot(SeuObj, group.by = "Slc6a3g", order = T) + th
+plot4 <- DimPlot(SeuObj, group.by = "Dbhg", order = T) + th
+layout1 <- "
+ABC
+DFG
+HIJ
+KLM
+"
+plot5 <-
+  FeaturePlotMultiple2(
+    SeuObj,
+    feature = c(
+      GABAergic,
+      Glutamatergic,
+      Cholinergic,
+      Noradrenergic,
+      AmineTranporter
+    ),
+    color = rep(
+      c("deepskyblue3", "limegreen", "chocolate2", "violetred2", "red"),
+      times = c(2, 3, 2, 1, 2)
+    ),
+    ord = T,
+    alf = 0.5,
+    minlim = "q1"
+  )
+plot5 <-
+  wrap_plots(plot5, guides = "keep", design = layout1) # Slc18a3, Slc17a7, Slc17a8 very low expression
+plot6 <-
+  FeaturePlotMultiple2(
+    SeuObj,
+    feature = c(Serotoninergic, AmineDegradetion),
+    color = rep(c("#6e2c00", "darkorange"), times = c(6, 3)),
+    ord = T,
+    alf = 0.5,
+    minlim = "q1"
+  )
+plot6 <-
+  wrap_plots(plot6, guides = "keep", design = layout1) # Tph1, Maob very low expression
+palfa <- plot_grid(plot1 , plot_grid(plot2, plot3, plot4, NULL, nrow = 1), ncol = 1)
+pbeta <- plot_grid(plot5, plot_grid(plot6, NULL, ncol = 1, rel_heights = c(8, 1)), nrow = 1)
+plot_grid(palfa, pbeta, ncol = 1, rel_heights = c(0.5, 1)) 
+}
+
+DotPlotRemake <- function(SeuObj, markers){
+markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1, p_val_adj <= 0.05) %>%
+    slice_head(n = 2) %>%
+    ungroup() -> top2
+dp <- DotPlot(SeuObj, features = unique(top2$gene), cluster.idents = T) + RotatedAxis()
+id.levels <- levels(dp$data$id)
+id.levels<- id.levels[(id.levels %in% top2$cluster)]
+id.levels.df <- data.frame(cluster = id.levels, ord = 1:length(id.levels))
+top2 <- left_join(id.levels.df, top2)
+ptop2 <- DotPlot(SeuObj, features = unique(top2$gene), cluster.idents = T, dot.scale = 3) + RotatedAxis() + theme(axis.text = element_text(size = 7))
+print(ptop2)
+markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1, p_val_adj <= 0.05) %>%
+    slice_head(n = 3) %>%
+    ungroup() -> top3
+dp <- DotPlot(SeuObj, features = unique(top3$gene), cluster.idents = T) + RotatedAxis()
+id.levels <- levels(dp$data$id)
+id.levels<- id.levels[(id.levels %in% top3$cluster)]
+id.levels.df <- data.frame(cluster = id.levels, ord = 1:length(id.levels))
+top3 <- left_join(id.levels.df, top3)
+ptop3 <- DotPlot(SeuObj, features = unique(top3$gene), cluster.idents = T, dot.scale = 3) + RotatedAxis() + theme(axis.text = element_text(size = 7))
+print(ptop3)
+return(list("top2" = top2, "top3" = top3))
+}
+
+DoHeatmapRemake <- function(SeuObj, assesed_genes, lims, colors_n, which_type, gene_names){
+
+my_palette <- colorRampPalette(c("magenta", "#440154ff", "black", "#fde725ff"), space = "Lab")(n = 200)
+
+SeuObj <- ScaleData(SeuObj, features = assesed_genes, assay = "RNA", verbose = F)
+assesed_genes <- GetAssayData(SeuObj, slot = "scale.data") %>% rownames()
+scale_data <- GetAssayData(SeuObj, slot = "scale.data")
+
+ha = HeatmapAnnotation(Clusters = SeuObj$seurat_clusters, col = list(Clusters = colors_n)) #DS = SeuObj$orig.iden # DS = c("`3rd`" = "#00BFC4", "`4th`" = "#F8766D"))
+clust_fact <- SeuObj$seurat_clusters %>% as.character()
+names(clust_fact) <- NULL
+
+set.seed(0)
+
+scale_data[scale_data >= lims] <- lims
+scale_data[scale_data <= -lims] <- -lims
+
+gene_names <- rep(gene_names, nrow(scale_data))
+row.labels <- ifelse(gene_names, rownames(scale_data), rep("", nrow(scale_data)))
+
+HM_OD <- Heatmap(scale_data, name = "Gene Scaled Exp",
+                 col = colorRamp2(seq(-(lims-0.5),(lims-0.5),0.01*(lims-0.5))[-1], my_palette),
+                 cluster_columns = cluster_within_group(scale_data, clust_fact),
+                 top_annotation = ha, show_row_dend = T, show_column_dend = F,
+                 cluster_rows = T,
+                 row_labels = row.labels,
+                 row_names_gp = gpar(fontsize = 5),
+                 column_labels = rep("", ncol(scale_data)),
+                 cluster_column_slices = T,
+                 clustering_distance_columns =  "euclidean",
+                 column_title_rot = 90, row_title = which_type,
+                 row_title_gp = gpar(col = "black", fontsize = 10),
+                 row_title_rot = 90,
+                 column_km_repeats = 100,
+                 row_km_repeats = 100)
+        
+HM_OD <- draw(HM_OD)
+
+}
+
+
+DoHeatmapRemakeAsSeurat <- function(SeuObj, markers, assesed_genes, lims, colors_n, which_type, gene_names){
+
+my_palette <- colorRampPalette(c("magenta", "#440154ff", "black", "#fde725ff"), space = "Lab")(n = 200)
+
+SeuObj <- ScaleData(SeuObj, features = assesed_genes, assay = "RNA", verbose = F)
+scale_data <- GetAssayData(SeuObj, slot = "scale.data")
+
+seurat_clusters <- SeuObj$seurat_clusters
+cells <- Cells(SeuObj)
+df <- data.frame(seurat_clusters, cells)
+cluster_order <- markers$cluster %>% unique() %>% as.character()
+df <- left_join(data.frame(seurat_clusters = cluster_order), df) %>% na.omit()
+head(df)
+
+ha = HeatmapAnnotation(Clusters = SeuObj$seurat_clusters[df$cells], col = list(Clusters = colors_n)) # DS = SeuObj$orig.ident[df$cells] #DS = c("`3rd`" = "#00BFC4", "`4th`" = "#F8766D")
+clust_fact <- SeuObj$seurat_clusters[df$cells] %>% as.character()
+names(clust_fact) <- NULL
+
+scale_data[scale_data >= lims] <- lims
+scale_data[scale_data <= -lims] <- -lims
+
+scale_data <- scale_data[assesed_genes, df$cells]
+gene_names <- rep(gene_names, nrow(scale_data))
+row.labels <- ifelse(gene_names, rownames(scale_data), rep("", nrow(scale_data)))
+
+HM_OD <- Heatmap(scale_data, name = "Gene Scaled Exp",
+                 col = colorRamp2(seq(-(lims-0.5),(lims-0.5),0.01*(lims-0.5))[-1], my_palette),
+                 cluster_columns = F,
+                 cluster_rows = F,
+                 top_annotation = ha, show_row_dend = F, show_column_dend = F,
+                 row_labels = row.labels,
+                 row_names_gp = gpar(fontsize = 5),
+                 column_labels = rep("", ncol(scale_data)),
+                 cluster_column_slices = F,
+                 column_title_rot = 90, row_title = which_type,
+                 row_title_gp = gpar(col = "black", fontsize = 10),
+                 row_title_rot =  90) 
+        
+HM_OD <- draw(HM_OD)
+}
+
+
+```
+
+## Import Input
+
+Import input from the 1st Data Set (DS)
+
+```{r ImportInput, include = FALSE}
+#### Run ####
+
+date = 231129
+
+##  Data ####
+
+## 1st DS to integrate
+
+SeuObj.singlet.merge <- readRDS("Outputs/231122_SeuInt_1st_fil_int_mayt1000lowt60000_lowtInfrb_SN_SoupXOut.rds")
+ clusters2analyze = c(0,1,2,3,4,5,6,7,8,9,10) %>% as.character()
+ text4stackbar = c(0,1,2,4,5,6,7) %>% as.character()
+ text4stackbarEGFP = c(0,6,8,9) %>% as.character()
+ cols_hash = c("#00BFC4", "#F8766D", "#C77CFF", "#D39200")
+ names(cols_hash) <- c("SNc-PD-2mo", "SNc-Ctrl-1mo", "SNc-PD-1mo", "SNc-Ctrl-2mo")
+UMIs.p.cell_lowthreshold = 1000 #2000
+UMIs.p.cell_highthreshold = 60000
+percent.rb_threshold = Inf
+
+Cells_SN_df <- readRDS("Outputs/Cre_Cells_SN_df.rds")
+```
+
+```{r ASW_batch_Int, include=TRUE}
+SeuObj.singlet.merge <- norm_seurat(SeuObj.singlet.merge)
+SeuObj.singlet.merge <- UMAP_maker(SeuObj.singlet.merge, 50, 10)
+SeuObj.singlet.merge <- RunTSNE(SeuObj.singlet.merge, dims = 1:4, perplexity = 100)
+
+# Obtain the ASW (Average Silhouette Width) batch score (integration quality parameter)
+# ElbowPlot(SeuObj.singlet.merge, ndims = 50)
+obj_dims = 30 # Dimensions to use
+d <-
+  stats::dist(Embeddings(SeuObj.singlet.merge, reduction = "pca")[, 1:obj_dims], method = "euclidean") # Create Matrix of Euclidean distances between all pair cells
+batches <-
+  tibble(CellNames = dimnames(SeuObj.singlet.merge)[[2]],
+         Batch = SeuObj.singlet.merge@meta.data$hash.ID) # Set the Batch correspondence to each cell
+batches <- mutate(batches, Batch_int = as.numeric(as.factor(Batch)))
+sil_batch <-
+  cluster::silhouette(x = batches$Batch_int - 1, dist = d) # Calculate SW for batch effect for each cell
+rm(batches, d)
+ASW_batch <-
+  mean(tibble::as_tibble(sil_batch[,])$sil_width) # Calculate the Average Silhoutte 
+```
+
+#### The ASW (Average Silhouette Width) batch score (integration quality parameter) for the NON integrated data is `r round(ASW_batch, 4)`
+
+```{r, include=TRUE}
+# ElbowPlot(SeuObj.singlet.merge, ndims = 50)
+SeuObj.singlet.merge_b <- subset(SeuObj.singlet.merge, subset = Treat == "Ctrl")
+obj_dims = 30 # Dimensions to use
+d <-
+  stats::dist(Embeddings(SeuObj.singlet.merge_b, reduction = "pca")[, 1:obj_dims], method = "euclidean") # Create Matrix of Euclidean distances between all pair cells
+# There are 2 type of reductions to use: "pca" and "umap". "pca" reduction has 50 dimensions while "umap" reduction has 2 dimensions. Since clustering is based on "pca" reductions, we will use "pca" reductions to get the silhoutte score. Despite everthing, UMAP is just a method to vizualize what is hoded on the 50 PCAs. But lets double check in the Seurat Paper and in my presentations if the Clustering use UMAP reduction
+batches <-
+  tibble(CellNames = dimnames(SeuObj.singlet.merge_b)[[2]],
+         Batch = SeuObj.singlet.merge_b@meta.data$hash.ID) # Set the Batch correspondence to each cell
+batches <- mutate(batches, Batch_int = as.numeric(as.factor(Batch)))
+sil_batch <-
+  cluster::silhouette(x = batches$Batch_int - 1, dist = d) # Calculate SW for batch effect for each cell
+rm(batches, d)
+ASW_batch <-
+  mean(tibble::as_tibble(sil_batch[,])$sil_width) # Calculate the Average Silhoutte 
+```
+
+#### The ASW (Average Silhouette Width) batch score (integration quality parameter) for the NON integrated data is `r round(ASW_batch, 4)`
+
+## Integrate Samples
+
+The way to do the integration is the following:
+
+-   Select the features to integrate: this are the joint 2000 top
+    variable features in all samples. The variable features are already
+    computed separately on each sample. Here, features are positively
+    ranked for being variable in all samples at the same time.
+
+-   For each pair of samples, find the pair of cells between them that
+    can match the best in the reduced PCA space (anchors) of each
+    sample. It is like finding the *k* nearest neighborhood of a cell in
+    the PCA projection of the paired sample
+
+-   Do a hierarchical clustering between samples (using a specific
+    distance calculation based on anchors) to get a guide tree to make
+    the integration of a pair of samples. For each pair: Integrate both
+    samples subtracting the expression values of the selected features
+    from one member of the anchor to the other member. Without changing
+    the values of the cells that couldn't be anchored? (mirar
+    anotaciones). A weight is also applied to penalize the distance
+    between each anchor. Repeat these steps using the newly generated
+    matrix and the following sample in the guide tree to integrate.
+
+    In my particular case, I integrated using the selected variable
+    features plus some neuronal, glial, and capilar cell-markers of
+    interest, plus the transgenes.
+
+-   Values for k.anchor, k.filter, k.score, max.features and k.weight
+    are obtained by the ones tested in the @otero-garcia2022 paper DS
+    (from Inma Cobos lab) which retrieved best ASW batch scores (see
+    Alzheimer_project/Scripts/scRNAseq_integration_RCPA_labmeet.html to
+    see the values)
+
+```{r Integrate, include = T}
+obj_dims = 30
+print("start integration")
+# Prepare the objects to integrate
+#SeuObj.singlet <- subset(SeuObj.singlet, subset = state == "singlet")
+SeuObj.singlet.split <-
+  SplitObject(SeuObj.singlet.merge, split.by = "hash.ID") # Create a list of Seurat Objects to integrate
+SeuObj.singlet.split <-
+  lapply(SeuObj.singlet.split, norm_seurat) # Normalize and select variable features
+SeuIntFeatures <-
+  SelectIntegrationFeatures(SeuObj.singlet.split, nfeatures = 2000) # Features (genes) to use in the integration
+SeuObj.singlet.split <-
+  lapply(SeuObj.singlet.split, preprocess_RPCA, SeuIntFeatures) # Pre-process data: Scale data and run PCA
+
+SNmark <-
+  c("Th",
+    "Slc6a3",
+    "Pitx3",
+    "Smad3",
+    "Neurod6",
+    "Slc18a3",
+    "Slc18a2",
+    "Ddc") # Removed markers:  "Adra1a" "Ovgp1", "Smad9", "Gal", "Galr1", "Npy", falta "Galr3" y "Galr2"
+Neuron <- c("Rbfox3") # General neurons
+Ex <- c("Slc17a6", "Slc17a7") # Excitatory neurons
+Inh <- c("Gad1") # Inhibitory neuron
+Astrocytes <- c("Gfap", "Gja1") # Removed markers: Blbp = Fabp7;
+Microglia <- c("C1qb") # Removed markers: Aif1 = Iba1
+OPC <- c("Olig1", "Tnr")
+Oligodendrocyte <- c("Tfrc", "Plp1", "Mbp") # Tfrc = Tfr
+Fibro <- c("Dcn") # Fibroblast
+Capil <- c("Flt1", "Rgs5")
+markers <- c("EGFP-KASH", "hSNCA-A53T", "mCherry",  "Snca")
+# GliaMark<-c("Aldh1l1", "Aldoc", "Olig2", "Cnp")
+
+# Cell-cell pairings (anchors) to do the integration
+# Method: Reciprocal PCA
+anchors <-
+  FindIntegrationAnchors(
+    SeuObj.singlet.split,
+    reduction = "rpca",
+    dims = 1:obj_dims,
+    #anchor.features = SeuIntFeatures,
+    anchor.features =  c(
+      SeuIntFeatures,
+      SNmark,
+      Neuron,
+      Ex,
+      Inh,
+      Fibro,
+      Astrocytes,
+      Microglia,
+      Oligodendrocyte,
+      OPC,
+      Capil,
+      markers
+    ),
+    scale = F,
+    k.anchor = 10,
+    k.filter = 100,
+    k.score = 20,
+    max.features = 100
+  ) # FindAnchors
+# Features to include in the integration (markers of different cell types, including Substancia Nigra (SN), extracted from PanglaoDb)
+
+# Integrate data including in the final matrix some marker genes
+SeuInt <-
+  IntegrateData(
+    anchorset = anchors,
+    dims = 1:obj_dims,
+    k.weight = 20,
+    features.to.integrate = c(
+      SeuIntFeatures,
+      SNmark,
+      Neuron,
+      Ex,
+      Inh,
+      Fibro,
+      Astrocytes,
+      Microglia,
+      Oligodendrocyte,
+      OPC,
+      Capil,
+      markers
+    )
+  )
+rm(anchors, SeuObj.singlet.split)
+```
+
+```{r, include=TRUE}
+SeuInt <- UMAP_maker(SeuInt, dims = 50, k.param = 10)
+SeuInt <- RunTSNE(SeuInt, dims = 1:4, perplexity = 100)
+
+# Obtain the ASW (Average Silhouette Width) batch score (integration quality parameter)
+# ElbowPlot(SeuInt, ndims = 50)
+obj_dims = 30 # Dimensions to use
+d <-
+  stats::dist(Embeddings(SeuInt, reduction = "pca")[, 1:obj_dims], method = "euclidean") # Create Matrix of Euclidean distances between all pair cells
+batches <-
+  tibble(CellNames = dimnames(SeuInt)[[2]],
+         Batch = SeuInt@meta.data$hash.ID) # Set the Batch correspondence to each cell
+batches <- mutate(batches, Batch_int = as.numeric(as.factor(Batch)))
+sil_batch <-
+  cluster::silhouette(x = batches$Batch_int - 1, dist = d) # Calculate SW for batch effect for each cell
+rm(batches, d)
+ASW_batch <-
+  mean(tibble::as_tibble(sil_batch[,])$sil_width) # Calculate the Average Silhoutte 
+```
+
+#### The ASW (Average Silhouette Width) batch score (integration quality parameter) for the integrated data is `r round(ASW_batch, 4)`
+
+```{r, include=TRUE}
+# ElbowPlot(SeuInt, ndims = 50)
+SeuInt_b <- subset(SeuInt, subset = Treat == "Ctrl")
+obj_dims = 30 # Dimensions to use
+d <-
+  stats::dist(Embeddings(SeuInt_b, reduction = "pca")[, 1:obj_dims], method = "euclidean") # Create Matrix of Euclidean distances between all pair cells
+# There are 2 type of reductions to use: "pca" and "umap". "pca" reduction has 50 dimensions while "umap" reduction has 2 dimensions. Since clustering is based on "pca" reductions, we will use "pca" reductions to get the silhoutte score. Despite everthing, UMAP is just a method to vizualize what is hoded on the 50 PCAs. But lets double check in the Seurat Paper and in my presentations if the Clustering use UMAP reduction
+batches <-
+  tibble(CellNames = dimnames(SeuInt_b)[[2]],
+         Batch = SeuInt_b@meta.data$hash.ID) # Set the Batch correspondence to each cell
+batches <- mutate(batches, Batch_int = as.numeric(as.factor(Batch)))
+sil_batch <-
+  cluster::silhouette(x = batches$Batch_int - 1, dist = d) # Calculate SW for batch effect for each cell
+rm(batches, d)
+ASW_batch <-
+  mean(tibble::as_tibble(sil_batch[,])$sil_width) # Calculate the Average Silhoutte 
+```
+
+#### The ASW (Average Silhouette Width) batch score (integration quality parameter) for the integrated data ONLY on Ctrl samples (different months as "replicates" of clusterization) is `r round(ASW_batch, 4)`
+
+### Find clusters with Louvain's algorithm
+
+See also which clusters have a higher number of intra-sample doublets
+and analyze some quality control measures of each of the clusters.
+
+```{r, include=T}
+SeuInt <-
+  FindNeighbors(SeuInt,
+                dims = 50,
+                k.param = 10,
+                compute.SNN = F)
+SeuInt <-
+  FindClusters(SeuInt,
+               resolution = 0.05,
+               #graph.name = "integrated_snn",
+               #group.singletons = F, NO HAY SINGLETONS
+               n.start = 100,
+               n.iter = 10)
+
+SeuInt <- RunUMAP(SeuInt, dims = 1:50)
+
+#SeuInt <- RunUMAP(SeuInt, graph = "integrated_snn")
+#(SeuInt, dims = 50, k.param = 10, graph = "integrated_snn")
+
+```
+
+```{r,  out.width= '150%', out.height= '70%', fig.asp=0.5}
+colors_n <- rainbow(length(unique(SeuInt@meta.data$seurat_clusters)))
+names(colors_n) <- unique(SeuInt@meta.data$seurat_clusters)
+UMAP.SeuInt1 <-
+  DimPlot(SeuInt, group.by = "hash.ID", cells =  sample(Cells(SeuInt)), cols = cols_hash)
+UMAP.SeuInt2 <-
+  DimPlot(SeuInt, group.by = "seurat_clusters", cols =  colors_n, cells =  sample(Cells(SeuInt)), label = T)
+(UMAP.SeuInt1 +  UMAP.SeuInt2) &
+  theme(legend.position = "none")
+tSNE.SeuInt1 <-
+  DimPlot(
+    SeuInt,
+    reduction = "tsne",
+    group.by = "hash.ID",
+    cells =  sample(Cells(SeuInt)),
+    cols = cols_hash
+  ) + guides(color = guide_legend(nrow = 4, override.aes = list(size=3)))
+tSNE.SeuInt2 <-
+  DimPlot(
+    SeuInt,
+    reduction = "tsne",
+    group.by = "seurat_clusters",
+    cols = colors_n,
+    cells =  sample(Cells(SeuInt))
+  )
+(tSNE.SeuInt1 +  tSNE.SeuInt2) &
+  theme(legend.position = "bottom", legend.key.size = unit(0.1, "cm"))
+```
+
+```{r, out.width= '100%', out.height= '100%'}
+# Plot QC graphics per cluster ####
+QC_plots(SeuInt, "", colors_n)
+```
+
+```{r}
+SeuInt <-
+  FindClusters(SeuInt,
+               resolution = 0.1,
+               #graph.name = "integrated_snn",
+               #group.singletons = F, NO HAY SINGLETONS
+               n.start = 100,
+               n.iter = 10)
+
+```
+
+```{r,  out.width= '150%', out.height= '70%', fig.asp=0.5}
+colors_n <- rainbow(length(unique(SeuInt@meta.data$seurat_clusters)))
+names(colors_n) <- unique(SeuInt@meta.data$seurat_clusters)
+UMAP.SeuInt1b <-
+  DimPlot(SeuInt, group.by = "hash.ID", cells =  sample(Cells(SeuInt)), cols = cols_hash)
+UMAP.SeuInt2b <-
+  DimPlot(SeuInt, group.by = "seurat_clusters", cols =  colors_n, cells =  sample(Cells(SeuInt)), label = T)
+(UMAP.SeuInt1b +  UMAP.SeuInt2 + UMAP.SeuInt2b) &
+  theme(legend.position = "none")
+tSNE.SeuInt1 <-
+  DimPlot(
+    SeuInt,
+    reduction = "tsne",
+    group.by = "hash.ID",
+    cells =  sample(Cells(SeuInt)),
+    cols = cols_hash
+  ) + guides(color = guide_legend(nrow = 4, override.aes = list(size=3)))
+tSNE.SeuInt2 <-
+  DimPlot(
+    SeuInt,
+    reduction = "tsne",
+    group.by = "seurat_clusters",
+    cols = colors_n,
+    cells =  sample(Cells(SeuInt))
+  )
+(tSNE.SeuInt1 +  tSNE.SeuInt2) &
+  theme(legend.position = "bottom", legend.key.size = unit(0.1, "cm"))
+```
+
+```{r}
+table(SeuInt$seurat_clusters, SeuInt$Treat, SeuInt$Age)
+```
+Delate cluster 20 and join 19 with 1:
+
+```{r}
+SeuInt <- subset(SeuInt, subset = seurat_clusters != "20")
+SeuInt$seurat_clusters <- gsub("19", "1", SeuInt$seurat_clusters)
+table(SeuInt$seurat_clusters, SeuInt$Treat, SeuInt$Age)
+SeuInt$seurat_clusters <- factor(SeuInt$seurat_clusters, levels = unique(SeuInt$seurat_clusters))
+Idents(SeuInt) <- SeuInt$seurat_clusters
+```
+
+```{r,  out.width= '150%', out.height= '70%', fig.asp=0.5}
+UMAP.SeuInt1c <-
+  DimPlot(SeuInt, group.by = "hash.ID", cells =  sample(Cells(SeuInt)), cols = cols_hash)
+UMAP.SeuInt2c <-
+  DimPlot(SeuInt, group.by = "seurat_clusters", cols =  colors_n, cells =  sample(Cells(SeuInt)), label = T)
+(UMAP.SeuInt1c +  UMAP.SeuInt2b + UMAP.SeuInt2c) &
+  theme(legend.position = "none")
+tSNE.SeuInt1 <-
+  DimPlot(
+    SeuInt,
+    reduction = "tsne",
+    group.by = "hash.ID",
+    cells =  sample(Cells(SeuInt)),
+    cols = cols_hash
+  ) + guides(color = guide_legend(nrow = 4, override.aes = list(size=3)))
+tSNE.SeuInt2 <-
+  DimPlot(
+    SeuInt,
+    reduction = "tsne",
+    group.by = "seurat_clusters",
+    cols = colors_n,
+    cells =  sample(Cells(SeuInt))
+  )
+(tSNE.SeuInt1 +  tSNE.SeuInt2) &
+  theme(legend.position = "bottom", legend.key.size = unit(0.1, "cm"))
+```
+
+```{r, out.width= '100%', out.height= '100%'}
+# Plot QC graphics per cluster ####
+QC_plots(SeuInt, "", colors_n)
+```
+
+### Re-do plot:
+
+```{r UMAP-TSNE-QC_Int_singlets, out.width= '100%', out.height= '100%'}
+((UMAP.SeuInt1c + guides(color = guide_legend(nrow = 4, override.aes = list(size=3)))) +  UMAP.SeuInt2c)&
+  theme(legend.position = "bottom",
+        legend.key.size = unit(0.1, "cm"))
+
+```
+
+### Color the UMAPs by library size:
+
+The plots differ in how the scale is adjusted.
+
+```{r UMAP_lbsz,  out.width= '100%', out.height= '75%', fig.asp=1.5}
+thfp <-
+  theme(plot.title = element_text(size = 9), legend.text = element_text(size = 4), axis.text = element_text(size = 4), axis.title = element_text(size = 4))
+fp1 <-
+  FeaturePlot(object = SeuInt,
+              features = "UMIs.p.cell",
+              cells =  sample(Cells(SeuInt))) + scale_colour_gradient(low = "lightblue", high = "darkblue") + 
+  labs(title = "All; no lim on lbsz")+ thfp
+
+fp2 <-
+  FeaturePlot(object = SeuInt,
+              features = "UMIs.p.cell",
+              cells =  sample(Cells(SeuInt))) + scale_colour_gradient(
+                limits = c(0, 10000),
+                low = "lightblue",
+                high = "darkblue"
+              ) +  labs(title = "All; scale lim to 10000") + thfp
+
+fp3 <-
+  FeaturePlot(object = SeuInt,
+              features = "UMIs.p.cell",
+              cells =  sample(Cells(SeuInt))) + scale_colour_gradient(
+                limits = c(0, 20000),
+                low = "lightblue",
+                high = "darkblue"
+              ) + labs(title = "All; scale lim to 20000") +thfp
+
+fp4 <-
+  FeaturePlot(
+    object = subset(SeuInt, subset = Treat == "Ctrl"),
+    features = "UMIs.p.cell",
+    cells =  sample(Cells(subset(
+      SeuInt, subset = Treat == "Ctrl"
+    )))
+  ) + scale_colour_gradient(
+    limits = c(0, 20000),
+    low = "lightblue",
+    high = "darkblue"
+  ) + labs(title = "Ctrl; scale lim to 20000") + thfp
+
+fp5 <-
+  FeaturePlot(
+    object = subset(SeuInt, subset = Treat == "PD"),
+    features = "UMIs.p.cell",
+    cells =  sample(Cells(subset(
+      SeuInt, subset = Treat == "PD"
+    )))
+  ) + scale_colour_gradient(
+    limits = c(0, 20000),
+    low = "lightblue",
+    high = "darkblue"
+  ) + labs(title = "PD; scale lim to 20000") + thfp
+
+fp6 <-
+  FeaturePlot(
+    object = subset(SeuInt, subset = Treat == "Ctrl" &
+                      Age == "1mo"),
+    features = "UMIs.p.cell",
+    cells =  sample(Cells(
+      subset(SeuInt, subset = Treat == "Ctrl" &
+               Age == "1mo")
+    ))
+  ) + scale_colour_gradient(
+    limits = c(0, 20000),
+    low = "lightblue",
+    high = "darkblue"
+  ) + labs(title = "Ctrl 1mo; scale lim to 20000") + thfp
+
+fp7 <-
+  FeaturePlot(
+    object = subset(SeuInt, subset = Treat == "Ctrl" &
+                      Age == "2mo"),
+    features = "UMIs.p.cell",
+    cells =  sample(Cells(
+      subset(SeuInt, subset = Treat == "Ctrl" &
+               Age == "2mo")
+    ))
+  ) + scale_colour_gradient(
+    limits = c(0, 20000),
+    low = "lightblue",
+    high = "darkblue"
+  ) + labs(title = "Ctrl 2mo; scale lim to 20000") + thfp
+
+plot_grid(fp1, fp2, fp3, fp4, fp5, fp6, fp7, NULL, ncol = 2)
+```
+
+## TryDifferentPCs
+
+```{r}
+SeuInt_1 <- SeuInt
+UMAPs <- TryDifferentPCs(SeuInt_1, dims = c(10, 15, 20), colors_n)
+UMAPs[[1]]
+UMAPs[[2]]
+UMAPs[[3]]
+```
+
+### Neuronal markers:
+
+-   Slc6a5 = Noradrenaline Transporter (NET)
+
+-   Th = Catalize L-DOPA production (precursor of Dopamine)
+
+-   Dbh = Catalize Noradrenaline production from Dopamine
+
+-   lightblue = GABAergic
+
+-   lightgreen = Glutamatergic
+
+-   brown = Cholinergic
+
+-   violet = DopamineTransporter
+
+-   red = AmineTranporter
+
+-   darkbrown = Serotoninergic
+
+```{r MarkerExpression, out.width= '150%', out.height= '50%', fig.asp=1.2}
+SeuInt_1_Ctrl <- subset(SeuInt_1, subset = Treat == "Ctrl")
+MarkerPlot(SeuInt_1_Ctrl)
+```
+
+
+## Make differential expression and then a dot plot to see if there are similar markers to the ones in Caramia 2023 paper.
+
+```{r}
+DefaultAssay(SeuInt_1_Ctrl) <- "RNA"
+SeuInt_1_n_Ctrl <- subset(SeuInt_1_Ctrl, subset = seurat_clusters != "3" & seurat_clusters != "5")
+SeuInt_1_n_Ctrl_markers <- FindAllMarkers(SeuInt_1_n_Ctrl, test.use = "MAST", latent.vars = "Age", only.pos =  T)
+tops_2and3 <- DotPlotRemake(SeuInt_1_n_Ctrl, SeuInt_1_n_Ctrl_markers)
+```
+
+If I compare this with the data of Caramia 2023, I can see that all clusters resemble some already described cluster, by exception of:
+
+-   cluster 5 (marked by Arpp21, "The encoded protein is enriched in the caudate nucleus and cerebellar cortex. A similar protein in mouse may be involved in regulating the effects of dopamine in the basal ganglia" and Tcf7l2, " plays a key role in the Wnt signaling pathway", **maybe a new cluster**),
+
+-   cluster 19 (marked by EGFP-KASH, Gm41333, and H2-K1 if I include 3rd top gene, which probably means that this cluster **is a product of viral infection itself** and not something biologically meaninful), 
+
+-   cluster 7 (marked by Dach1, which "cell fate determination during development" and Cdh8, "putatively involved in synaptic adhesion, axon outgrowth and guidance", probably representing **cells under development**),
+
+-   cluster 10 (marked by mt-Co1 and mt-Cytb, probably also a product of the technique, resembling many mRNAs in the sequencing "soup"),
+
+-   cluster 11 (marked by Adamts2, a metalloprotease, and Sp100, part of PML nuclear bodie, maybe a new cluster or a response to AAV?),
+
+-   cluster 18 (marked by Nos1 and Prima1 and Chat, **maybe acetylcholinergic cells**).
+
+
+## Make differential expression with an equilibrated DS (less cells for cluster 0, 1, 2 and 4) and then a dot plot to see if there are similar markers to the ones in Caramia 2023 paper.
+
+```{r}
+table(SeuInt_1_Ctrl$seurat_clusters, SeuInt_1_Ctrl$Age)
+cells_df <- data.frame(seurat_clusters = SeuInt_1_n_Ctrl$seurat_clusters, cells = Cells(SeuInt_1_n_Ctrl))
+cluster_0_cells <- filter(cells_df, seurat_clusters == "0")$cells
+cluster_1_cells <- filter(cells_df, seurat_clusters == "1")$cells
+cluster_2_cells <- filter(cells_df, seurat_clusters == "2")$cells
+other_cells <- filter(cells_df, seurat_clusters != "0" & seurat_clusters != "1" & seurat_clusters != "2")$cells
+SeuInt_1_n_Ctrl_small <- subset(SeuInt_1_n_Ctrl, cells = c(other_cells, sample(cluster_0_cells, 100), sample(cluster_1_cells, 100), sample(cluster_2_cells, 100)))
+
+DimPlot(SeuInt_1_n_Ctrl_small, group.by = "seurat_clusters", order = T, label = T, cols = colors_n) +  theme_void(base_size = 10) + NoLegend() 
+table(SeuInt_1_n_Ctrl_small$seurat_clusters, SeuInt_1_n_Ctrl_small$Age)
+
+SeuInt_1_n_Ctrl_markers_small <- FindAllMarkers(SeuInt_1_n_Ctrl_small, test.use = "MAST", latent.vars = "Age", only.pos =  T)
+tops_2and3_small <- DotPlotRemake(SeuInt_1_n_Ctrl_small, SeuInt_1_n_Ctrl_markers_small)
+```
+
+For 1mo
+```{r}
+tops_2and3_small <- DotPlotRemake(subset(SeuInt_1_n_Ctrl_small, subset = Age == "1mo"), SeuInt_1_n_Ctrl_markers_small)
+```
+
+For 2mo
+```{r}
+tops_2and3_small <- DotPlotRemake(subset(SeuInt_1_n_Ctrl_small, subset = Age == "2mo"), SeuInt_1_n_Ctrl_markers_small)
+```
+
+
+
+Given this, I would not consider this equalized DS.
+
+## Some info about these markers
+
+If I compare this with the data of Caramia 2023, I can see that all clusters resemble some already described cluster, by exception of:
+
+-   cluster 8 (marked by Arpp21, "The encoded protein is enriched in the caudate nucleus and cerebellar cortex. A similar protein in mouse may be involved in regulating the effects of dopamine in the basal ganglia" and Tcf7l2, " plays a key role in the Wnt signaling pathway", **maybe a new cluster**),
+
+-   cluster 19 (marked by EGFP-KASH, Gm41333, and H2-K1 if I include 3rd top gene, which probably means that this cluster **is a product of viral infection itself** and not something biologically meaninful), 
+
+-   cluster 7 (marked by Dach1, which "cell fate determination during development" and Cdh8, "putatively involved in synaptic adhesion, axon outgrowth and guidance", probably representing **cells under development**),
+
+-   cluster 10 (marked by mt-Co1 and mt-Cytb, probably also a product of the technique, resembling many mRNAs in the sequencing "soup"),
+
+-   cluster 11 (marked by Adamts2, a metalloprotease, and Sp100, part of PML nuclear bodie, maybe a new cluster or a response to AAV?),
+
+-   cluster 18 (marked by Nos1 and Prima1 and Chat, **maybe acetylcholinergic cells**).
+
+
+## space for the 2mo?
+
+Now:
+
+-   Cluster 8 expreess Nrgn, "postsynaptic protein kinase substrate that binds calmodulin in the absence of calcium" (**new cluster?**),
+
+-   cluster 19 is not marked by any gene (reinforcing the hypothesyis that is a **technical artifact**).
+
+-   Cluster 13 Gm32647, which was comparable to Caramia 2023 data, now express Gm1130 (maybe this is also present on Caramia's data but in another rank, look for it after).
+
+-   Cluster 7, remains mostly the same, but also expressing now Tcf4, which "may play an important role in nervous system development" (**a cluster under development?**) characteristic of some clusters in Carmia's data and also characteristic of cluster 14 and 10 in our data.
+
+-   Cluster 14 now changed and express Pde3a.
+
+-   Cluster 10 now has changed and express Chn2, Zic1 and Cnr1 (a gene involved in migration, a genes involved in development and a cannabinnoid receptor). Maybe this changing clusters are under some developmental process.
+
+-   Cluster 11 now express Ebf1, a TF of RNA-PolII, C1ql4, maybe a negative regulator of proliferation, and Nr4a2 which "mutations in this gene have been associated with disorders related to dopaminergic dysfunction, including Parkinson disease".
+
+-   Cluster 18 now express Slc5a7, which is a cholinergic transport, supporting the fact that **this clusters is a cholinergic cluster**.
+
+The clusters that are already present in Caramia's lab are marked by:
+
+-   cluster 9: Nfib (negative TF of PolII "Involved in brain development"), Pbx1 (TF involved in development). (Carmia's cluster 11 or 22) **in development**
+
+-   cluster 11: Sema5a (involved in "axonal guidance during neural development"). (Carmia's cluster 7, 14 or 18) **in development**
+
+-   cluster 12: Zfhx3 (TF that regulates neuronal differentiation). (Carmia's cluster 17) **in development**
+
+-   cluster 13: Gm32647 (a lncRNA, maybe involved in development), Vmn1r207, and 209 (vomeronasal receptors, maybe part of the olfactory system?). (Caramia's cluster 17) **in olfatory system**
+
+-   cluster 14: Zfpm2 (involved in development of other cell types). (Caramia's cluster 2) **in development**
+
+-   cluster 12: Zfp804b (enable to bind ion and act in the nucleus). (Caramia's cluster 11, 15 or 18). **?**
+
+# Just for the second (more discriminative) clustering:
+
+## How top genes are seen
+
+Define top genes as the ones that has a absolute log2FC stronger than 1
+
+```{r}
+SeuInt_1_n_Ctrl_markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1, p_val_adj <= 0.05) -> tops
+
+DoHeatmapRemake(SeuInt_1_n_Ctrl, assesed_genes = unique(tops$gene), 2.5, colors_n, which_type = "Tops", gene_names = F)
+```
+
+Just addressing the top5 genes
+
+```{r}
+slice_head(tops, n = 5) %>%
+    ungroup() -> top5
+
+DoHeatmapRemake(SeuInt_1_n_Ctrl, assesed_genes = unique(top5$gene), 2.5, colors_n, which_type = "Top 5", gene_names = T)
+```
+
+Same but for the equalized DS, tops
+
+```{r}
+DoHeatmapRemake(SeuInt_1_n_Ctrl_small, assesed_genes = unique(tops$gene), 2.5, colors_n, which_type = "Tops", gene_names = F)
+```
+
+Same but for the equalized DS, top 5
+
+```{r}
+DoHeatmapRemake(SeuInt_1_n_Ctrl_small, assesed_genes = unique(top5$gene), 2.5, colors_n, which_type = "Top 5", gene_names = T)
+```
+
+For the 1mo
+```{r}
+DoHeatmapRemakeAsSeurat(subset(SeuInt_1_n_Ctrl_small, subset = Age == "1mo"), markers = SeuInt_1_n_Ctrl_markers_small,  assesed_genes = unique(top5$gene), 2.5, colors_n, which_type = "Top 5", gene_names = T)
+```
+
+For the 2mo
+```{r}
+DoHeatmapRemakeAsSeurat(subset(SeuInt_1_n_Ctrl_small, subset = Age == "2mo"), markers = SeuInt_1_n_Ctrl_markers_small, assesed_genes = unique(top5$gene), 2.5, colors_n, which_type = "Top 5", gene_names = T)
+```
+
+#### Are these clusters differentially differentiated?
+
+"Cell Fate" pathway genes
+
+```{r}
+pw_genes <- readRDS("Outputs/pw_genes_fate_diff.rds")
+pw_genes <- do.call(rbind, pw_genes)
+tops$gene[tops$gene %in% unique(pw_genes$SYMBOL)]
+DoHeatmapRemake(SeuInt_1_n_Ctrl, assesed_genes = unique(pw_genes$SYMBOL), 2.5, colors_n, which_type = "Cell Fate", gene_names = T)
+```
+
+"Neuronal Development" pathway genes
+
+```{r}
+pw_genes <- readRDS("Outputs/pw_genes_develop_diff.rds")
+pw_genes <- do.call(rbind, pw_genes)
+
+DoHeatmapRemake(SeuInt_1_n_Ctrl, assesed_genes = unique(pw_genes$SYMBOL), 2.5, colors_n, which_type = "Neuronal Development", gene_names = F)
+```
+
+
+"Neuronal Development" pathway genes from tops
+
+```{r}
+DoHeatmapRemake(SeuInt_1_n_Ctrl, assesed_genes = unique(tops$gene[tops$gene %in% unique(pw_genes$SYMBOL)]), 2.5, colors_n, which_type = "Tops in Neuronal Development", gene_names = T)
+```
+
+Ploted as Seurat
+
+```{r}
+DoHeatmapRemakeAsSeurat(SeuInt_1_n_Ctrl, markers = tops, assesed_genes = unique(tops$gene[tops$gene %in% unique(pw_genes$SYMBOL)]), 2.5, colors_n, which_type = "Tops in Neuronal Development", gene_names = T)
+```
+
+% of DEG associated to development from total DEG
+
+```{r}
+length(tops$gene[tops$gene %in% unique(pw_genes$SYMBOL)])/length(tops$gene)
+```
+
+Just the 9% of DEGs are developmental genes.
+
+And the dot plot of these genes is
+
+```{r}
+SeuInt_1_n_Ctrl_markers_reduced <- filter(SeuInt_1_n_Ctrl_markers, gene %in% unique(pw_genes$SYMBOL))
+tops_2and3 <- DotPlotRemake(SeuInt_1_n_Ctrl, SeuInt_1_n_Ctrl_markers_reduced)
+```
+
+For 1mo
+```{r}
+tops_2and3_small <- DotPlotRemake(subset(SeuInt_1_n_Ctrl_small, subset = Age == "1mo"), SeuInt_1_n_Ctrl_markers_reduced)
+```
+
+For 2mo
+```{r}
+tops_2and3_small <- DotPlotRemake(subset(SeuInt_1_n_Ctrl_small, subset = Age == "2mo"), SeuInt_1_n_Ctrl_markers_reduced)
+```
+
+
+#### The same but for the equalized DS
+
+
+"Neuronal Development" pathway genes from tops
+
+```{r}
+SeuInt_1_n_Ctrl_markers_small %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1, p_val_adj <= 0.05) -> tops_small
+
+DoHeatmapRemake(SeuInt_1_n_Ctrl_small, assesed_genes = unique(tops_small$gene[tops_small$gene %in% unique(pw_genes$SYMBOL)]), 2.5, colors_n, which_type = "Tops in Neuronal Development", gene_names = T)
+```
+
+Ploted as Seurat
+
+```{r}
+DoHeatmapRemakeAsSeurat(SeuInt_1_n_Ctrl_small, markers = tops_small, assesed_genes = unique(tops_small$gene[tops_small$gene %in% unique(pw_genes$SYMBOL)]), 2.5, colors_n, which_type = "Tops in Neuronal Development", gene_names = T)
+```
+
+For the 1mo
+```{r}
+DoHeatmapRemakeAsSeurat(subset(SeuInt_1_n_Ctrl_small, subset = Age == "1mo"), markers = SeuInt_1_n_Ctrl_markers_small,  assesed_genes = unique(tops_small$gene[tops_small$gene %in% unique(pw_genes$SYMBOL)]), 2.5, colors_n, which_type = "Tops in Neuronal Development", gene_names = T)
+```
+
+For the 2mo
+```{r}
+DoHeatmapRemakeAsSeurat(subset(SeuInt_1_n_Ctrl_small, subset = Age == "2mo"), markers = SeuInt_1_n_Ctrl_markers_small, assesed_genes = unique(tops_small$gene[tops_small$gene %in% unique(pw_genes$SYMBOL)]), 2.5, colors_n, which_type = "Tops in Neuronal Development", gene_names = T)
+```
+
+
+"Axonogenesis" pathway from tops_small
+
+```{r}
+pw_genes <- readRDS("Outputs/pw_genes_axonogenesis.rds")
+pw_genes <- do.call(rbind, pw_genes)
+
+DoHeatmapRemake(SeuInt_1_n_Ctrl_small, assesed_genes = unique(tops_small$gene[tops_small$gene %in% unique(pw_genes$SYMBOL)]), 2.5, colors_n, which_type = "Tops in Axonogenesis", gene_names = T)
+```
+
+Ploted as Seurat
+
+```{r}
+DoHeatmapRemakeAsSeurat(SeuInt_1_n_Ctrl_small, markers = tops_small, assesed_genes = unique(tops_small$gene[tops_small$gene %in% unique(pw_genes$SYMBOL)]), 2.5, colors_n, which_type = "Tops in Axonogenesis", gene_names = T)
+```
+
+"Neuron Projection Morphogenesis" pathway from tops_small
+
+```{r}
+pw_genes <- readRDS("Outputs/pw_genes_neu_project_morpho.rds")
+pw_genes <- do.call(rbind, pw_genes)
+
+DoHeatmapRemake(SeuInt_1_n_Ctrl_small, assesed_genes = unique(tops_small$gene[tops_small$gene %in% unique(pw_genes$SYMBOL)]), 2.5, colors_n, which_type = "Tops in Neuron Projection Morphogenesis", gene_names = T)
+```
+
+Ploted as Seurat
+
+```{r}
+DoHeatmapRemakeAsSeurat(SeuInt_1_n_Ctrl_small, markers = tops_small, assesed_genes = unique(tops_small$gene[tops_small$gene %in% unique(pw_genes$SYMBOL)]), 2.5, colors_n, which_type = "Tops in Neuron Projection Morphogenesis", gene_names = T)
+```
+
+"Cerebellar Development" pathway from tops_small
+
+```{r}
+pw_genes <- readRDS("Outputs/pw_genes_cerebellar_develop.rds")
+pw_genes <- do.call(rbind, pw_genes)
+
+DoHeatmapRemake(SeuInt_1_n_Ctrl_small, assesed_genes = unique(tops_small$gene[tops_small$gene %in% unique(pw_genes$SYMBOL)]), 2.5, colors_n, which_type = "Tops in Cerebellar Development", gene_names = T)
+```
+
+Ploted as Seurat
+
+```{r}
+DoHeatmapRemakeAsSeurat(SeuInt_1_n_Ctrl_small, markers = tops_small, assesed_genes = unique(tops_small$gene[tops_small$gene %in% unique(pw_genes$SYMBOL)]), 2.5, colors_n, which_type = "Tops in Cerebellar Development", gene_names = T)
+```
+
+
+"Gliogenesis, individual terms" pathway
+
+```{r}
+pw_genes <- readRDS("Outputs/pw_genes_gliogenesis_individual_terms.rds")
+pw_genes <- do.call(rbind, pw_genes)
+unique(tops_small$gene[tops_small$gene %in% unique(pw_genes$SYMBOL)])
+DoHeatmapRemake(SeuInt_1_n_Ctrl_small, assesed_genes = unique(pw_genes$SYMBOL), 2.5, colors_n, which_type = "Gliogenesis, individual terms", gene_names = T)
+```
+
+
+"Noradrenergic Development, individual terms" pathway
+
+```{r}
+pw_genes <- readRDS("Outputs/pw_genes_noradrenergic_development.rds")
+pw_genes <- do.call(rbind, pw_genes)
+unique(tops_small$gene[tops_small$gene %in% unique(pw_genes$SYMBOL)])
+
+DoHeatmapRemake(SeuInt_1_n_Ctrl_small, assesed_genes = unique(pw_genes$SYMBOL), 2.5, colors_n, which_type = "Noradrenergic Development, individual terms", gene_names = T)
+```
+
+```{r}
+SeuInt_1_n_Ctrl_markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) -> tops_complete
+
+all_genes_expressed <- rownames(SeuInt_1_n_Ctrl)[apply(GetAssayData(SeuInt_1_n_Ctrl, slot = "data"), 1, sum) > 0]
+
+saveRDS(all_genes_expressed, paste0("Outputs/", date, "_QC_first_part_tidy_all_genes_expressed_SN.rds"))
+saveRDS(tops_complete, paste0("Outputs/", date, "_QC_first_part_tidy_tops_DEGs_complete_SN.rds"))
+saveRDS(tops, paste0("Outputs/", date, "_QC_first_part_tidy_tops_DEGs_SN.rds"))
+saveRDS(colors_n, paste0("Outputs/", date, "_QC_first_part_tidy_cluster_colors_SN.rds"))
+```
+
+
+Output to make differential expression analysis
+```{r}
+saveRDS(SeuInt_1, paste0("Outputs/", date, "_SeuInt_1st_fil_int_mayt1000lowt60000_lowtInfrb.rds"))
+```

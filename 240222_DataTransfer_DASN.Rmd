@@ -1,0 +1,427 @@
+---
+title: "Data Transfer DA-SN"
+author: "Camila Arcuschin; Ignacio Schor"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    theme: cerulean
+    code_folding: hide
+out.width: '30%'
+out.heigh: '100%'
+fig.width: '100%'
+fig.height: '100%'
+dpi: 100
+editor_options: 
+  markdown: 
+    wrap: 72
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, echo = TRUE, warning = FALSE, cache=F, dev = c('png', 'pdf'))
+knitr::opts_knit$set(root.dir = "/data_husihuilke/shared/SMB/carcu/Parkinsons_project/")
+```
+
+```{r, include=FALSE}
+library(Seurat)
+library(SeuratDisk)
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library(cowplot)
+library(future)
+#register(MulticoreParam(10))
+plan(multisession, workers = 6)
+# plan("multiprocess", workers = 6)
+options(future.globals.maxSize = 4000 * 1024^2)
+options(ggrepel.max.overlaps = Inf)
+```
+
+```{r}
+UMAP_maker <- function(obj, dims, k.param) {
+  ScaleData(object = obj) %>%
+    RunPCA(npcs = dims) %>%
+    FindNeighbors(dims = 1:dims, k.param = k.param) %>% #Esta linea no har?a falta, igual creo que no cambiar?a nada porque siempre lo estoy pisando.
+    RunUMAP(dims = 1:dims)
+} # The reason why I have FindNeighbours here is because, if I want to replot UMAP whithout changing the cluster already assigned, I could do it
+
+```
+
+
+plotear tmb los clusters en la transferencia al UMAP de query, probar tambien hacer un rpca para el transfer label y  plotear tambien los grupos de pagoda cuando lo hago sin glia
+
+```{r}
+CellType_colors <- c("MBDOP2" = "#d11141", "DEGLU5" = "#f37735",  "MEGLU5" = "#00b159", "MEGLU6" = "#AACC00", "MEINH4" = "#00aedb", "MEINH2" = "#006CC2", "MEINH8" = "darkblue", "MEINH10" = "#491CC4", "ACMB" = "#B56576", "EPMB" = "#9100B1", "MEGLU1"  = "#325300", "MEGLU4" = "#554A00", "MEGLU2" = "#415000", "MEGLU10" = "#005900", "MEGLU11" = "#00ac1d", "MEGLU14" = "#4da500", "MEGLU9" = "#006852",  "MEGLU8" = "#007c27")
+#colors_n <- colors_n[as.character(c(0:14))[-13]]
+# group123_colors <- readRDS("Outputs/230830_pagoda_neuron_group_colors_CtrlPD_Group12.rds")
+# group123_colors <- group123_colors[c(1,2,3,6)]
+# names(group123_colors) <- c(1,2,3,4)
+
+my_theme <- theme_void(base_size = 6) + theme(title = element_text(face = "bold"))
+```
+
+## DataTransfer between 2 reference DS
+
+### RNA-RNA-LogNormalize-RPCA
+
+```{r}
+SeuRef <- Connect(filename = "Data/Linnarson/l6_r4.loom", mode = "r")
+SeuRef
+SeuRef <- as.Seurat(SeuRef) # es un archivo medio pesado pero se puede
+# dim(SeuRef)
+grep("Midb", SeuRef@meta.data$Region, value = T) %>% unique()
+SeuRef <- subset(SeuRef, subset = Region == "Midbrain ventral" | Region == "Midbrain dorsal" | Region == "Midbrain dorsal,Midbrain ventral")
+SeuRef@meta.data$Age %>% unique()
+SeuRef <- subset(SeuRef, subset = Age == "p25-27" | Age == "p24" | Age == "p30" | Age == "p29" | Age == "p26" | Age == "p25" | Age == "p28")
+dim(SeuRef)
+gc()
+
+DefaultAssay(SeuRef) <- "RNA"
+
+SeuRef <- NormalizeData(SeuRef,
+                normalization.method = "LogNormalize",
+                scale.factor = 10000) %>%
+  FindVariableFeatures(
+    selection.method = "vst",
+    nfeatures = 2000,
+    loess.span = 0.6
+  )
+
+SeuRef <- ScaleData(SeuRef) %>%
+  RunPCA(npcs = 30, reduction.name = "pca.RNA")
+
+SeuRef <-  RunUMAP(
+    SeuRef,
+    dims = 1:30,
+    reduction = "pca.RNA",
+    return.model = TRUE
+  )
+
+DimPlot(SeuRef, group.by = "Class")
+DimPlot(SeuRef, group.by = "ClusterName")
+DimPlot(SeuRef, group.by = "Region") + theme(legend.position = "bottom", legend.text = element_text(size = 3), legend.key.size = unit(0.1, "cm"))
+DimPlot(SeuRef, group.by = "Neurotransmitter") + theme(legend.position = "bottom", legend.text = element_text(size = 3), legend.key.size = unit(0.1, "cm"))
+DimPlot(SeuRef, group.by = "DonorID") + theme(legend.position = "bottom", legend.text = element_text(size = 3), legend.key.size = unit(0.1, "cm"))
+DimPlot(SeuRef, group.by = "Flowcell") + theme(legend.position = "bottom", legend.text = element_text(size = 3), legend.key.size = unit(0.1, "cm"))
+DimPlot(SeuRef, group.by = "ChipID") + theme(legend.position = "bottom", legend.text = element_text(size = 3), legend.key.size = unit(0.1, "cm"))
+
+check_clust <- cbind(SeuRef$Description, SeuRef$ClusterName) %>% cbind( SeuRef$Neurotransmitter)
+rownames(check_clust) <- NULL
+unique(check_clust)
+
+
+SeuRef2 <- readRDS("Data/Saunders/Seurat_P60SubstantiaNigra.rds")
+colors_saunders <- readRDS("Data/Saunders/colors_Seurat_P60SubstantiaNigra.rds")
+
+anchors <- FindTransferAnchors(
+  reference = SeuRef2,
+  reference.assay = "RNA",
+  reference.reduction = "pca", #Even in reciprocal PCA: # pcaproject is used as the weight.matrix in MapQuery
+  reduction = "rpca",
+  query = SeuRef,
+  query.assay = "RNA",
+  dims = 1:30,
+  normalization.method = "LogNormalize"
+)
+predictions <- TransferData(anchorset = anchors,
+                            refdata = SeuRef2$cx.disp,
+                            dims = 1:30)
+SeuRef <- AddMetaData(SeuRef, metadata = predictions)
+
+DefaultAssay(SeuRef) <- "RNA"
+a <- DimPlot(SeuRef, group.by = "ClusterName", label = F, order = F, cols = CellType_colors) + theme_void() + guides(color = guide_legend(nrow = 6, override.aes = list(size=1), label.position = "left", label.hjust = 1)) + theme(title = element_text(size = 10), legend.position = c(0.5, -0.2), legend.text = element_text(size = 7, margin = margin(l = 10, unit = "pt"), hjust =1.1), plot.margin = unit(c(1,30,50,1), units = "mm"), legend.key.width = unit(0.55, "cm"), legend.key.height = unit(0.2, "cm"))
+b_fixed <- DimPlot(SeuRef, group.by = "predicted.id", label = F, order = F, cols = colors_saunders) + theme_void() + guides(color = guide_legend(nrow = 22, override.aes = list(size=1), label.position = "left", label.hjust = 1)) + theme(title = element_text(size = 10), legend.position = c(0.4, -0.2), legend.text = element_text(size = 7, margin = margin(l = 10, unit = "pt"), hjust =1.1), plot.margin = unit(c(1,30,50,1), units = "mm"), legend.key.width = unit(0.55, "cm"), legend.key.height = unit(0.2, "cm"))
+a + b_fixed
+
+####
+
+SeuRef2 <-  RunUMAP(
+    SeuRef2,
+    dims = 1:30,
+    reduction = "pca",
+    return.model = TRUE
+  )
+
+SeuInt_PU <- ProjectUMAP(
+  query = SeuRef,
+  query.dims = 1:30,
+  query.reduction = "pca.RNA",
+  reference = SeuRef2,
+  reference.dims = 1:30,
+  reference.reduction = "pca",
+  k.param = 30,
+  reduction.model = "umap",
+  reduction.name = "projectedUMAP")
+
+p1 <-  DimPlot(
+    SeuRef2,
+    reduction = "umap",
+    group.by = "cx.disp",
+    cols = colors_saunders,
+    label = T,
+    label.size = 1,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F) + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+
+p2 <- DimPlot(
+    SeuInt_PU,
+    reduction = "projectedUMAP",
+    group.by = "predicted.id",
+    cols = colors_saunders,
+    label = F,
+    label.size = 3,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F) + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+
+p3 <- DimPlot(
+    SeuInt_PU,
+    reduction = "projectedUMAP",
+    group.by = "ClusterName",
+    cols = CellType_colors,
+    label = F,
+    label.size = 3,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F) + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+
+plot_grid(p1, p2, p3, ncol = 3, nrow = 1)
+
+####
+
+
+SeuInt_MQ_Reference <-  MapQuery(
+    anchorset = anchors,
+    reference = SeuRef2,
+    query = SeuRef,
+    refdata = list(celltype = "cx.disp"),
+    reference.reduction = "pca",
+    reduction.model = "umap"
+  )
+p1 <-  DimPlot(
+    SeuRef2,
+    reduction = "umap",
+    group.by = "cx.disp",
+    cols = colors_saunders,
+    label = TRUE,
+    label.size = 1,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+p2 <-  DimPlot(
+    SeuInt_MQ_Reference,
+    reduction = "ref.umap",
+    group.by = "predicted.id",
+    cols = colors_saunders,
+    label = TRUE,
+    label.size = 1,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Query transferred labels") 
+
+p3 <-  DimPlot(
+    SeuInt_MQ_Reference,
+    reduction = "ref.umap",
+    group.by = "ClusterName",
+    cols = CellType_colors,
+    label = TRUE,
+    label.size = 1,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Clusters") 
+
+plot_grid(p1, p2, p3, ncol = 3, nrow = 1)
+```
+
+## DataTransfer between SN 1stDS and each of the references
+
+### RNA-RNA-LogNormalize-RPCA
+
+```{r}
+#SeuInt <- readRDS("Outputs/231024_SeuInt_1st_fil_int_mayt1000lowt60000_lowtInfrb_SN.rds")
+SeuInt <- readRDS("Outputs/231129_SeuInt_1st_fil_int_mayt1000lowt60000_lowtInfrb.rds")
+SeuInt <- subset(SeuInt, subset = Treat == "Ctrl")
+#SeuInt <- subset(SeuInt, subset = Treat == "Ctrl", idents = c(0,1,6,7,9,10,11,13,14))
+colors_n <- readRDS("Outputs/231129_QC_first_part_tidy_cluster_colors_SN.rds")
+
+anchors <- FindTransferAnchors(
+  reference = SeuRef2,
+  reference.assay = "RNA",
+  reference.reduction = "pca", #Even in reciprocal PCA: # pcaproject is used as the weight.matrix in MapQuery
+  reduction = "rpca",
+  query = SeuInt,
+  query.assay = "RNA",
+  dims = 1:30,
+  normalization.method = "LogNormalize"
+)
+predictions <- TransferData(anchorset = anchors,
+                            refdata = SeuRef2$cx.disp,
+                            dims = 1:30)
+predictions <- rename(predictions, "saund.prediction" = "predicted.id", "saund.prediction.score.max" = "prediction.score.max")
+saveRDS(predictions, "Outputs/240222_DataTransfer_DASN_predictions_ctrl.rds")
+
+SeuInt <- AddMetaData(SeuInt, metadata = predictions)
+
+DefaultAssay(SeuRef) <- "RNA"
+a <- DimPlot(SeuInt, group.by = "seurat_clusters", label = T, pt.size = 0.1, order = F, cols = colors_n) + theme_void() + guides(color = guide_legend(nrow = 6, override.aes = list(size=0.5), label.position = "left", label.hjust = 1)) + theme(title = element_text(size = 2), legend.position = c(0.5, -0.2), 
+                                                                                                                                                                                                                                                                     legend.text = element_text(size = 1, margin = margin(l = 10, unit = "pt"), hjust =1.1), 
+                                                                                                                                                                                                                                                                     plot.margin = unit(c(1,30,50,1), units = "mm"), 
+                                                                                                                                                                                                                                                                     legend.key.width = unit(0.55, "cm"), 
+                                                                                                                                                                                                                                                                     legend.key.height = unit(0.2, "cm"))
+b <- DimPlot(SeuInt, group.by = "saund.prediction", label = F, pt.size = 0.1, order = F, cols = colors_saunders) + theme_void() + guides(color = guide_legend(nrow = 15, ncol = 4, override.aes = list(size=0.5), label.position = "left", label.hjust = 1)) + theme(title = element_text(size = 2), legend.position = c(0.3, -0.2), legend.text = element_text(size = 1, margin = margin(l = 10, unit = "pt"), hjust =1.1), plot.margin = unit(c(1,30,50,1), units = "mm"), legend.key.width = unit(0.55, "cm"), legend.key.height = unit(0.2, "cm"))
+a + b
+
+DefaultAssay(SeuRef) <- "RNA"
+a <- DimPlot(SeuInt, group.by = "seurat_clusters", label = T, label.size = 1, pt.size = 0.1, order = F, cols = colors_n) + theme_void() + guides(color = guide_legend(nrow = 6, override.aes = list(size=0.5), label.position = "left", label.hjust = 1)) + theme(title = element_text(size = 2), legend.position = c(0.5, -0.2), legend.text = element_text(size = 1, margin = margin(l = 10, unit = "pt"), hjust =1.1), plot.margin = unit(c(1,30,50,1), units = "mm"), legend.key.width = unit(0.55, "cm"), legend.key.height = unit(0.2, "cm"))
+b <- DimPlot(SeuInt, group.by = "saund.prediction", label = T, label.size = 1, pt.size = 0.1, order = F, cols = colors_saunders) + theme_void() + guides(color = guide_legend(nrow = 22, override.aes = list(size=0.5), label.position = "left", label.hjust = 1)) + theme(title = element_text(size = 2), legend.position = c(0.3, -0.2), legend.text = element_text(size = 1, margin = margin(l = 10, unit = "pt"), hjust =1.1), plot.margin = unit(c(1,30,50,1), units = "mm"), legend.key.width = unit(0.55, "cm"), legend.key.height = unit(0.2, "cm"))
+a + b
+
+SeuInt_MQ_Ref2 <-  MapQuery(
+    anchorset = anchors,
+    reference = SeuRef2,
+    query = SeuInt,
+    refdata = list(celltype = "cx.disp"),
+    reference.reduction = "pca",
+    reduction.model = "umap"
+  )
+p1 <-  DimPlot(
+    SeuRef2,
+    reduction = "umap",
+    group.by = "cx.disp",
+    cols = colors_saunders,
+    label = TRUE,
+    label.size = 1,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+p2 <-  DimPlot(
+    SeuInt_MQ_Ref2,
+    reduction = "ref.umap",
+    group.by = "saund.prediction",
+    cols = colors_saunders,
+    label = TRUE,
+    label.size = 1,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Query transferred labels") 
+
+p3 <-  DimPlot(
+    SeuInt_MQ_Ref2,
+    reduction = "ref.umap",
+    group.by = "seurat_clusters",
+    cols = colors_n,
+    label = TRUE,
+    label.size = 1,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Clusters") 
+
+plot_grid(p1, p2, p3, ncol = 3, nrow = 1)
+
+saveRDS(SeuInt_MQ_Ref2, "Outputs/SeuInt_MQ_Ref2_saunders.rds")
+saveRDS(SeuRef2, "Outputs/SeuRef2_saunders.rds")
+
+
+anchors <- FindTransferAnchors(
+  reference = SeuRef,
+  reference.assay = "RNA",
+  reference.reduction = "pca.RNA", #Even in reciprocal PCA: # pcaproject is used as the weight.matrix in MapQuery
+  reduction = "rpca",
+  query = SeuInt,
+  query.assay = "RNA",
+  dims = 1:30,
+  normalization.method = "LogNormalize"
+)
+predictions <- TransferData(anchorset = anchors,
+                            refdata = SeuRef$ClusterName,
+                            dims = 1:30)
+
+predictions <- rename(predictions, "linn.prediction" = "predicted.id", "linn.prediction.score.max" = "prediction.score.max")
+SeuInt <- AddMetaData(SeuInt, metadata = predictions)
+
+c <- DimPlot(SeuInt, group.by = "linn.prediction", label = T, label.size = 1, order = F, cols = CellType_colors) + theme_void() + guides(color = guide_legend(nrow = 22, override.aes = list(size=1), label.position = "left", label.hjust = 1)) + theme(title = element_text(size = 10), legend.position = c(0.4, -0.2), legend.text = element_text(size = 7, margin = margin(l = 10, unit = "pt"), hjust =1.1), plot.margin = unit(c(1,30,50,1), units = "mm"), legend.key.width = unit(0.55, "cm"), legend.key.height = unit(0.2, "cm"))
+
+a + b + c
+
+SeuInt_MQ_Ref <-  MapQuery(
+    anchorset = anchors,
+    reference = SeuRef,
+    query = SeuInt,
+    refdata = list(celltype = "ClusterName"),
+    reference.reduction = "pca.RNA",
+    reduction.model = "umap"
+  )
+p1 <-  DimPlot(
+    SeuRef,
+    reduction = "umap",
+    group.by = "ClusterName",
+    cols = CellType_colors,
+    label = TRUE,
+    label.size = 1,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Reference annotations")
+p2 <-  DimPlot(
+    SeuInt_MQ_Ref,
+    reduction = "ref.umap",
+    group.by = "linn.prediction",
+    cols = CellType_colors,
+    label = TRUE,
+    label.size = 1,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Query transferred labels") 
+
+p3 <-  DimPlot(
+    SeuInt_MQ_Ref,
+    reduction = "ref.umap",
+    group.by = "seurat_clusters",
+    cols = colors_n,
+    label = TRUE,
+    label.size = 1,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Clusters") 
+
+
+p4 <-  DimPlot(
+    SeuInt_MQ_Ref,
+    reduction = "ref.umap",
+    group.by = "saund.prediction",
+    cols = colors_saunders,
+    label = TRUE,
+    label.size = 1,
+    repel = TRUE,
+    pt.size = 0.3,
+    order = F
+  ) + my_theme + theme(legend.position = "none") + ggtitle("Clusters")
+
+# p5 <-  DimPlot(
+#     SeuInt_MQ_Reference,
+#     reduction = "ref.umap",
+#     group.by = "predicted.id",
+#     cols = colors_saunders,
+#     label = TRUE,
+#     label.size = 1,
+#     repel = TRUE,
+#     pt.size = 0.3,
+#     order = F
+#   ) + my_theme + theme(legend.position = "none") + ggtitle("Clusters")
+
+
+plot_grid(p1, p2, p3, p4, b_fixed + my_theme + theme(legend.position = "none") + ggtitle("Clusters"), ncol = 3, nrow = 2)
+
+```
+
+

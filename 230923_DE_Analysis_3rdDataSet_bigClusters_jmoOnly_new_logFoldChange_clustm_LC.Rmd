@@ -1,0 +1,920 @@
+---
+title: "Differential expression analysis Big Clusters"
+author: "Camila Arcuschin; Ignacio Schor"
+date: "r Sys.Date()"
+output: 
+  html_document:
+    toc: true
+    theme: cerulean
+    code_folding: hide
+out.width: '30%'
+out.heigh: '100%'
+fig.width: '100%'
+fig.height: '100%'
+dpi: 100
+editor_options: 
+  markdown: 
+    wrap: 72
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, echo = TRUE, warning = FALSE)
+knitr::opts_knit$set(root.dir = "/data_husihuilke/shared/SMB/carcu/Parkinsons_project/")
+```
+
+```{r, include=FALSE}
+library(Seurat)
+library(tidyverse)
+library(DESeq2)
+library(zinbwave)
+library(scran)
+library(RhpcBLASctl)
+library(ggrepel)
+library(BiocParallel)
+library(DT)
+register(MulticoreParam(10))
+```
+
+```{r, include=FALSE}
+#### Functions
+FCfun <- function (res_DE){
+  res_DE$diffexpressed <- "NO"
+  res_DE$diffexpressed[res_DE$log2FoldChange > 0.5 & res_DE$padj <= 0.05] <- "UP"
+  res_DE$diffexpressed[res_DE$log2FoldChange < -0.5 & res_DE$padj <= 0.05] <- "DOWN"
+  res_DE$delabel <- NA
+  res_DE$delabel[res_DE$diffexpressed != "NO"] <- res_DE$Gene[res_DE$diffexpressed != "NO"]
+  res_DE$diffexpressed[res_DE$Gene == "hSNCA-A53T"] <- "hSNCA-A53T"
+  res_DE$diffexpressed <- factor(res_DE$diffexpressed, levels = c("hSNCA-A53T", "UP", "NO", "DOWN"))
+  res_DE <- arrange(res_DE, desc(diffexpressed))
+
+  res_DE <- filter(res_DE, Gene != "Ttr") # abs(log2FoldChage) > 8
+  Volcano<-ggplot(data=res_DE , aes(x=log2FoldChange, y=-log10(padj), col=diffexpressed, label=delabel)) +
+    geom_point() +
+    theme_minimal() +
+    geom_text_repel(max.overlaps = 100) +
+    scale_color_manual(values=c("DOWN" = "blue", "NO" = "black", "UP" = "red",  "hSNCA-A53T" = "green")) +
+    geom_vline(xintercept=c(-0.5, 0.5), col="red") +
+    geom_hline(yintercept=-log10(0.05), col="red")
+  Volcano
+}
+
+## Exclude unwellcomed genes from labeling, in the effect measure
+FCfun2 <- function (res_DE, fc, pad, notWellcome, min, max){
+  res_DE$diffexpressed <- "NO"
+  res_DE$diffexpressed[res_DE$log2FC > fc & res_DE$padj <= pad] <- "UP"
+  res_DE$diffexpressed[res_DE$log2FC < -fc & res_DE$padj <= pad] <- "DOWN"
+  res_DE$delabel <- NA
+  res_DE$delabel[res_DE$diffexpressed != "NO"] <- res_DE$Gene[res_DE$diffexpressed != "NO"]
+  res_DE$diffexpressed[res_DE$Gene == "hSNCA-A53T"] <- "hSNCA-A53T"
+  res_DE$diffexpressed <- factor(res_DE$diffexpressed, levels = c("hSNCA-A53T", "UP", "NO", "DOWN"))
+  res_DE <- arrange(res_DE, desc(diffexpressed))
+  res_DE$delabel[res_DE$Gene %in% notWellcome] <- NA
+  
+  Volcano<-ggplot(data=res_DE, aes(x=log2FC, y=-log10(padj), col=diffexpressed, label=delabel)) +
+    geom_point() +
+    theme_minimal() +
+    xlim(min, max) +
+    geom_text_repel(max.overlaps = 100) +
+    scale_color_manual(values=c("DOWN" = "blue", "NO" = "black", "UP" = "red", "hSNCA-A53T" = "green")) +
+    geom_vline(xintercept=c(-fc, fc), col="red") +
+    geom_hline(yintercept=-log10(pad), col="red")
+  Volcano
+}
+
+## Exclude unwellcomed genes from labeling, in the effect measure
+FCfun3 <- function (res_DE, fc, pad, notWellcome, min, max){
+  res_DE$diffexpressed <- "NO"
+  res_DE$diffexpressed[res_DE$log2FoldChange > fc & res_DE$padj <= pad] <- "UP"
+  res_DE$diffexpressed[res_DE$log2FoldChange < -fc & res_DE$padj <= pad] <- "DOWN"
+  res_DE$delabel <- NA
+  res_DE$delabel[res_DE$diffexpressed != "NO"] <- res_DE$Gene[res_DE$diffexpressed != "NO"]
+  res_DE$diffexpressed[res_DE$Gene == "hSNCA-A53T"] <- "hSNCA-A53T"
+  res_DE$diffexpressed <- factor(res_DE$diffexpressed, levels = c("hSNCA-A53T", "UP", "NO", "DOWN"))
+  res_DE <- arrange(res_DE, desc(diffexpressed))
+  res_DE$delabel[res_DE$Gene %in% notWellcome] <- NA
+  
+  Volcano<-ggplot(data=res_DE , aes(x=log2FoldChange, y=-log10(padj), col=diffexpressed, label=delabel)) +
+    geom_point() +
+    theme_minimal() +
+    xlim(min, max) +
+    geom_text_repel(max.overlaps = 100) +
+    scale_color_manual(values=c("DOWN" = "blue", "NO" = "black", "UP" = "red", "hSNCA-A53T" = "green")) +
+    geom_vline(xintercept=c(-fc, fc), col="red") +
+    geom_hline(yintercept=-log10(pad), col="red")
+  Volcano
+}
+
+## Label specific genes, in the log2FC measure
+FCfun4 <- function (res_DE, fc, pad, GenesLab, min, max){
+  res_DE$diffexpressed <- "NO"
+  res_DE$diffexpressed[res_DE$log2FC > fc & res_DE$padj <= pad] <- "UP"
+  res_DE$diffexpressed[res_DE$log2FC < -fc & res_DE$padj <= pad] <- "DOWN"
+  res_DE$delabel <- NA
+  res_DE$delabel[res_DE$Gene %in% GenesLab] <- res_DE$Gene[res_DE$Gene %in% GenesLab]
+  res_DE$diffexpressed[res_DE$Gene == "hSNCA-A53T"] <- "hSNCA-A53T"
+  res_DE$diffexpressed <- factor(res_DE$diffexpressed, levels = c("hSNCA-A53T", "UP", "NO", "DOWN"))
+  res_DE <- arrange(res_DE, desc(diffexpressed))
+
+  
+  Volcano<-ggplot(data=res_DE, aes(x=log2FC, y=-log10(padj), col=diffexpressed, label=delabel)) +
+    geom_point() +
+    theme_minimal() +
+    xlim(min, max) +
+    geom_text_repel(max.overlaps = 100) +
+    scale_color_manual(values=c("DOWN" = "blue", "NO" = "black", "UP" = "red", "hSNCA-A53T" = "green")) +
+    geom_vline(xintercept=c(-fc, fc), col="red") +
+    geom_hline(yintercept=-log10(pad), col="red")
+  Volcano
+}
+
+## Label specific genes, in the effect measure
+FCfun5 <- function (res_DE, fc, pad, GenesLab, min, max){
+  res_DE$diffexpressed <- "NO"
+  res_DE$diffexpressed[res_DE$log2FoldChange > fc & res_DE$padj <= pad] <- "UP"
+  res_DE$diffexpressed[res_DE$log2FoldChange < -fc & res_DE$padj <= pad] <- "DOWN"
+  res_DE$delabel <- NA
+  res_DE$delabel[res_DE$Gene %in% GenesLab] <- res_DE$Gene[res_DE$Gene %in% GenesLab]
+  res_DE$diffexpressed[res_DE$Gene == "hSNCA-A53T"] <- "hSNCA-A53T"
+  res_DE$diffexpressed <- factor(res_DE$diffexpressed, levels = c("hSNCA-A53T", "UP", "NO", "DOWN"))
+  res_DE <- arrange(res_DE, desc(diffexpressed))
+  
+  Volcano<-ggplot(data=res_DE, aes(x=log2FoldChange, y=-log10(padj), col=diffexpressed, label=delabel)) +
+    geom_point() +
+    theme_minimal() +
+    xlim(min, max) +
+    geom_text_repel(max.overlaps = 100) +
+    scale_color_manual(values=c("DOWN" = "blue", "NO" = "black", "UP" = "red", "hSNCA-A53T" = "green")) +
+    geom_vline(xintercept=c(-fc, fc), col="red") +
+    geom_hline(yintercept=-log10(pad), col="red")
+  Volcano
+}
+```
+
+## Subseted analyzed data
+
+Post processed data from the QC Analysis of the integration of both Data
+Sets (DS) was imported for DE analysis. In this case specifically, cells
+from cluster m, jmo were used and genes expressed in at least the 10% of the
+whole DS with an average of more than -1 log10 counts were selected (average of 0.1 counts).
+
+## DE Analysis
+
+[The model:]{.underline}
+
+For DE Analysis, we are doing an nbinomLRT. This means that we are doing
+a Likelihood Ratio Test of a full vs. a reduced model that both of them
+fit the data to a negative binomial model.
+
+In this context, the full model is:
+
+$$
+Counts ⁓ orig.ident + Treat + orig.ident:Treat 
+$$
+
+And the reduced model is:
+
+$$
+Counts ⁓ orig.ident 
+$$
+
+As you can see, the reduced model only lacks the
+$Treat + orig.ident:Treat$ terms and leaves the $orig.ident$ term to
+avoid retriving genes which are only differnt in a specific
+origin.ident. $orig.ident:Treat$ term couldn't been leaved because the
+program hestitate that we are excluding a simplier term but retaining
+the complexier ones, which violates the [principle of
+marginality](https://en.wikipedia.org/wiki/Principle_of_marginality).
+
+[Control of dropouts:]{.underline}
+
+To control for dropouts, we are using the method specified by Michael
+Love, which combines [ZINB-WaVE and
+DESeq](https://github.com/mikelove/zinbwave-deseq2/blob/master/zinbwave-deseq2.knit.md).
+This method apply a weighted matrix to the deconvoluted-normalized
+counts to compensate typical single cell high dropout rate. This matrix
+is obtained by fitting the raw data to a Zero Inflated Negative Binomial
+model and computing the expected zero rate for each gene in each cell.
+Also, the vignette of Love, use a deconvolution method to calculate a
+pooled size factor for count normalization (developed in *scran* pkg).
+This means that the counts are normalized by a pseudo library size which
+is obtained by: 1) pooling k similar cells together , 2) calculating the
+pooled expression for each gene and 3) retrieving the median of that
+pooled expression.
+
+[Estimate dispersion:]{.underline}
+
+Dispersion was estimated using `fitType="local"` parameter because the
+algorithm couldn't find parameters `a` and `b` to fit a function between
+mean and variance (and that is because is pretty plain the relationship)
+
+Other recommendation we followed from Michael Love for the analysis of
+single cell data was to use a `minmu=1e-6` in the `nbinomLRT()` function
+
+```{r CoreAnalysis, message=FALSE}
+#args =  commandArgs(trailingOnly=TRUE)
+m = args[1] #number of the cluster
+j = args[2]
+file = args[3]
+date = args[4]
+
+  SeuObj <- readRDS(paste0("Outputs/", file))
+  DefaultAssay(SeuObj) <- "RNA"
+  SeuObj <- SetAssayData(SeuObj, assay.type = "RNA", slot = "counts", new.data = round(GetAssayData(SeuObj, slot = "counts"), 0))
+  #GetAssayData(object = SeuObj, slot = "counts")
+  SeuObj@meta.data <- select(SeuObj@meta.data, seurat_clusters, Treat, Age, orig.ident)
+  genenames <- rownames(SeuObj[["RNA"]]) 
+  SceLC <- subset(SeuObj, subset = seurat_clusters == m & Age == j)
+  SceLC <- DietSeurat(SceLC)
+  SceLC <- as.SingleCellExperiment(SceLC)
+  Average_Counts <- rowMeans(assays(SceLC)[["counts"]]) %>% log10()
+  ExpressingCells <- rowSums(assays(SceLC)[["counts"]]>0)
+  PropExpressingCells <- ExpressingCells/dim(SceLC)[2]
+  #png(paste0("Outputs/", date, "_Avg_vs_Exp_3rdDataSet_Clust", m, ".png"))
+  print(plot(Average_Counts, PropExpressingCells))
+  #dev.off()
+  gPEC_Avg <- data.frame(Genes = rownames(SceLC), AvgCounts = Average_Counts, PEC = PropExpressingCells)
+  write_tsv(gPEC_Avg, paste0("Outputs/", date, "_Gene_PropExpressingCells_AvgCounts_clust", m, "_", j, "_LC.tsv"))
+  Average_Counts["hSNCA-A53T"] # -0.191786 
+  PropExpressingCells["hSNCA-A53T"] # 0.1865456
+  if (Average_Counts["hSNCA-A53T"] > -1 & PropExpressingCells["hSNCA-A53T"] > 0.1){
+    SceLC <- SceLC[Average_Counts > -1 & PropExpressingCells > 0.1, ]
+    rownames(SceLC) <- genenames[Average_Counts > -1 & PropExpressingCells > 0.1]
+  } else {
+    SceLC <- rbind(SceLC[Average_Counts > -1 & PropExpressingCells > 0.1, ], SceLC["hSNCA-A53T",])
+    rownames(SceLC) <- c(genenames[Average_Counts > -1 & PropExpressingCells > 0.1], "hSNCA-A53T")
+  }
+  #as("SummarizedExperiment")
+  rm(.Random.seed)
+  set.seed(0)
+  rm(SeuObj)
+  #colData(SceLC) <- select(colData(Sce), "orig.ident")
+  colData(SceLC)$Treat <- factor(x = colData(SceLC)$Treat)
+  colData(SceLC)$Age <- factor(x = colData(SceLC)$Age)
+  colData(SceLC)$orig.ident <- factor(x = colData(SceLC)$orig.ident)
+  blas_set_num_threads(1)
+  assay(SceLC) <- as.matrix(assay(SceLC))
+  SceLC <- scran::convertTo(SceLC, type = "DESeq2")
+  weights <- computeObservationalWeights(zinbFit(SceLC, X="~orig.ident + Treat + orig.ident:Treat", commondispersion = TRUE, epsilon=1e12), counts(SceLC))
+  #print("ya pase por zinbwave")
+  assays(SceLC,  withDimnames = FALSE)[["weights"]] <- weights
+  #clusters <- quickCluster(SceLC, min.size = 20) # Generate clusters for deconvolution to adust dropout values. min.size = An integer scalar specifying the minimum size of each cluster. Doesn't make sense to use clusters with a very sparse data set like mine and no biological clusters (only cluster 0 is beeing analyzed).
+  SceLC <- scran::computeSumFactors(SceLC)#, clusters = clusters) # Compute sizeFactors for each cell avoiding biases because of dropouts (using deconvolution method by scran).
+  sf_lbsz_plot <- plot(sizeFactors(SceLC), colSums(assay(SceLC))) # Plot quality control of size factors estimation. Must correlate to lib size. Some scattered is epected because of DE genes
+  #png(paste0("Outputs/", date, "_SizeFactors_vs_LibSize_3rdDataSet_Clust", m, ".png"))
+  print(sf_lbsz_plot)
+  #dev.off()
+  #AgeVec <- c("jmo", "jmo")
+  design(SceLC) <- formula(~orig.ident + orig.ident:Treat + Treat)# + orig.ident:Treat + orig.ident:Treat:Age)
+  #sd_vst <- DESeq2::varianceStabilizingTransformation(SceLC, fitType = "local", blind = TRUE) %>% 
+  #  assay() %>% apply(MARGIN = 1, sd) %>% sort(decreasing = T)
+  #VariableFeatures <- names(which(sd_vst>1))
+  #VariableFeatures <- names(sort(sd_vst, decreasing = T)[1:2000])
+  SceLC <- DESeq2::estimateDispersions(object = SceLC, fitType='local') # fitType "local" because the algorithm couldn't find parameters a and b to fit a function between mean and variance (and that is because is preatty plain the relationship)
+  #SceLC <- SceLC[VariableFeatures, ]
+  SceLC <- nbinomLRT(SceLC, reduced= ~orig.ident, minmu = 1e-6)
+  #SceLC <- DESeq2::replaceOutliers(SceLC, minReplicates = 7) #No pareceria estar haciendo nada, al menos con este dataset
+```
+
+```{r, include=FALSE}
+gc()
+```
+
+`#Independent Hypothesis Weighting (Ignatiadis et al. 2016)??`
+
+Note: in `results()`, the `contrast` parameter doesn't allow to put in a
+list 2 elements that share `resultsName`. This is why we decide to
+analyze only the effects of the model terms or calculate log2FC by
+ourself and not to use the DESeq2 automatic log2FC calculation.
+
+#### Calculate the PD treatment effect on each (others) condition combination.
+
+For every effect calculation, independent filtering (by minimum mean
+expression) and Cook's cutoff to remove outliers, was applied.
+
+(Unfold the code to see the code to return each of the effects)
+
+On jmo origin 3rd:
+
+```{r}
+# of PD in jmo origin 3rd
+eff_PD_jmo_3rd <- DESeq2::results(object = SceLC, contrast = list(c("Treat_PD_vs_Ctrl")), alpha = 0.05, independentFiltering=F, cooksCutoff=F )
+```
+
+What is exactly this "effect" (aka: "log2FoldChange")?
+Is literally the value of the coefficient of the glm that I am interested in. As I can see in this correlation.
+
+```{r}
+  ExactSameCoefSummed <- coef(SceLC)[,c("Treat_PD_vs_Ctrl" )]
+  FC_df <- data.frame(ExactSameCoefSummed, Gene = rownames(coef(SceLC)))
+ FC_df_jmo_3rd <- data.frame(eff_PD_jmo_3rd) %>% mutate(Gene = rownames(eff_PD_jmo_3rd)) %>% inner_join(FC_df)
+  GeneLab <- if_else(FC_df_jmo_3rd$Gene == "hSNCA-A53T", "hSNCA-A53T", "NA")
+  GeneLab[GeneLab == "NA"] <- NA
+  FC_df_jmo_3rd$GeneLab <- GeneLab
+  
+  FC_df_jmo_3rd %>% ggplot(aes( x= ExactSameCoefSummed, y = log2FoldChange, color = Gene == "hSNCA-A53T", label = GeneLab)) + 
+    geom_point(alpha = 1) + 
+    scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+    geom_text_repel(max.overlaps = 100, color = "red") + 
+    theme(legend.position = "none")
+```
+
+On jmo origin 4th:
+
+If I would like to get the log2FC of 4th/3rd in PD treatment, instead of
+the coefficients, I would like to do the FC as:
+
+$$FC  = \frac{e^{Summed CoeffPDin4thDS}}{e^{Summed CoeffCtrlin4th DS}} $$
+
+$$FC = \frac{e^{Intercept + orig.ident\_.4th.\_vs\_.3rd + Treat\_PD\_vs\_Ctrl + orig.ident.4th..TreatPD}}{e^{Intercept + orig.ident\_.4th.\_vs\_.3rd}}$$
+$$FC = e^{Intercept + orig.ident\_.4th.\_vs\_.3rd. + Treat\_PD\_vs\_Ctrl + orig.ident.4th..TreatPD - Intercept - orig.ident\_.4th.\_vs\_.3rd}$$
+$$FC = e^{Treat\_PD\_vs\_Ctrl +  orig.ident.4th..TreatPD}$$ So,
+the equivalent at the summed coefficient level, would be:
+
+```{r}
+## Treatment effect
+
+# of PD in jmo origin 4th
+eff_PD_jmo_4th <- DESeq2::results(object = SceLC, contrast = list(c("Treat_PD_vs_Ctrl", "orig.ident.4th..TreatPD")), alpha = 0.05, independentFiltering=F, cooksCutoff=F )
+```
+
+To check again what is retrieved by the `results()` output:
+
+```{r}
+  ExactSameCoefSummed <- coef(SceLC)[,c("Treat_PD_vs_Ctrl", "orig.ident.4th..TreatPD")] %>% rowSums()
+  FC_df <- data.frame(ExactSameCoefSummed, Gene = rownames(coef(SceLC)))
+  FC_df_jmo_4th <- data.frame(eff_PD_jmo_4th) %>% mutate(Gene = rownames(eff_PD_jmo_4th)) %>% inner_join(FC_df)
+  GeneLab <- if_else(FC_df_jmo_4th$Gene == "hSNCA-A53T", "hSNCA-A53T", "NA")
+  GeneLab[GeneLab == "NA"] <- NA
+  FC_df_jmo_4th$GeneLab <- GeneLab
+  
+  FC_df_jmo_4th %>% ggplot(aes( x= ExactSameCoefSummed, y = log2FoldChange, color = Gene == "hSNCA-A53T", label = GeneLab)) + 
+    geom_point(alpha = 1) +
+    scale_color_manual(values = c("FALSE" = "black", "TRUE" = "red")) +
+    geom_text_repel(max.overlaps = 100, color = "red") + 
+    theme(legend.position = "none")
+```
+
+
+###### Now calculate the effect of the replicate on each condition
+
+Effect of origin 4th vs origin 3rd in the jmo of the Ctrl hemisphere:
+
+```{r}
+eff_orig_Ctrl <- DESeq2::results(object = SceLC, contrast = list("orig.ident_.4th._vs_.3rd."), alpha = 0.05, independentFiltering=F, cooksCutoff=F )
+```
+
+Effect of origin 4th vs origin 3rd in the PD hemisphere:
+
+If I would like to get the log2FC of 4th/3rd in PD treatment, instead of
+the coefficients, I would like to do the FC as:
+
+$$FC  = \frac{e^{Summed CoeffPDin4thDS}}{e^{Summed CoeffPDin3rd DS}} $$
+
+$$FC = \frac{e^{Intercept + orig.ident\_.4th.\_vs\_.3rd + Treat\_PD\_vs\_Ctrl + orig.ident.4th..TreatPD}}{e^{Intercept + Treat\_PD\_vs\_Ctrl}}$$
+$$FC = e^{Intercept + orig.ident\_.4th.\_vs\_.3rd. + Treat\_PD\_vs\_Ctrl + orig.ident.4th..TreatPD - Intercept - Treat\_PD\_vs\_Ctrl}$$
+$$FC = e^{orig.ident\_.4th.\_vs\_.3rd. +  orig.ident.4th..TreatPD}$$ So,
+the equivalent at the summed coefficient level, would be:
+
+```{r}
+eff_orig_PD <- DESeq2::results(object = SceLC, contrast = list(c("orig.ident_.4th._vs_.3rd.", "orig.ident.4th..TreatPD")), alpha = 0.05, independentFiltering=F, cooksCutoff=F ) # same as res_DEa
+```
+
+Append everything to the list `res`:
+
+```{r}
+res <- list("eff_PD_jmo_3rd" = eff_PD_jmo_3rd, 
+            "eff_PD_jmo_4th" = eff_PD_jmo_4th,
+            "eff_orig_Ctrl" = eff_orig_Ctrl, 
+            "eff_orig_PD" = eff_orig_PD)
+#saveRDS(res_DE, paste0("Outputs/", date, "_Differentially_expressed_3rdDataSet_Clust", m, "_PDvsCtrl.rds")) #Seguir modificando desde aca!
+res <- lapply(res, function(x) {data.frame(x) %>% mutate(Gene = rownames(x))})
+```
+
+## Plot the correlation of effects for DE genes:
+
+Now, we will take the above calculated **effects** (not the log2FC, despite `DESeq2::results()` function names any output as "log2FoldChange") and
+plot the correlation of them (**at the level of the lineal estimator**),
+to see how much the replicates resemble each other and how differnt is
+the effect of PD treatment in the jmo and the jmo.
+
+The red line correspond to the "expected" perfect correlation and the
+blue and green lines divide positives and negative effects for each
+condition combination.
+
+#### In jmo, the effect of PD in 3rd vs. 4th DS:
+
+```{r}
+FCmat <- inner_join(res[["eff_PD_jmo_4th"]], res[["eff_PD_jmo_3rd"]], by = c("Gene", "padj"), suffix =  c("4th", "3rd"))
+  #FCmat <- FCmat %>% filter(padj <= 0.05)
+  GeneLab <- if_else(FCmat$Gene == "hSNCA-A53T", "hSNCA-A53T", "NA")
+  GeneLab[GeneLab == "NA"] <- NA
+  FCmat %>% ggplot(aes(x = log2FoldChange4th, y = log2FoldChange3rd, label = GeneLab, color = Gene == "hSNCA-A53T")) + geom_point(alpha = 0.2) +
+    scale_color_manual(values = c("black", "red")) +
+    geom_text_repel(max.overlaps = 100, color = "red") + 
+    theme(legend.position = "none") +
+    geom_abline(slope = 1, color = "red") + 
+    geom_hline(yintercept = 0, color = "blue") + 
+    geom_vline(xintercept = 0, color = "green") +
+    labs(title = "The effect of PD in 3rd vs 4th DS", subtitle = paste0("In the ", j))
+  
+#filter(FCmat, log2FoldChange4th > 10, log2FoldChange3rd > 10, pvalue4th <= 0.05)
+  
+```
+
+```{r}
+# At first glance what we can see is there much more "differntially expressed" genes in the jmo of this cluster than for the jmo. Also, we can see as it is seen in the jmo, that there is a huge difference between the expression effect of hSNCA-A53T in PD between the 3rd and the 4th DS. However, given the fact that this gene is the treatment that we are using, it doesn't seem to be affecting the "log2FoldChange", since the range of these for the rest of the genes goes approx from -1 to 1 in both DS. 
+# Also there is another gene that seems an outlier and cannot make us seen the true relation between the measures.
+# Now, without looking to that largest effect in the 4th data-set because of that gene, which is "Uty":
+# 
+# FCmat <- inner_join(res[["eff_PD_jmo_4th"]], res[["eff_PD_jmo_3rd"]], by = c("Gene", "padj"), suffix =  c("4th", "3rd"))
+#   FCmat <- FCmat %>% filter(padj <= 0.05)
+#   FCmat$Gene[FCmat$log2FoldChange4th < -15] # "Uty"
+#   FCmat <- FCmat %>% filter(Gene != "Uty")
+#   GeneLab <- if_else(FCmat$Gene == "hSNCA-A53T", "hSNCA-A53T", "NA")
+#   GeneLab[GeneLab == "NA"] <- NA
+#   FCmat %>% ggplot(aes(x = log2FoldChange4th, y = log2FoldChange3rd, label = GeneLab, color = Gene == "hSNCA-A53T")) + geom_point(alpha = 0.2) +
+#     scale_color_manual(values = c("black", "red")) +
+#     scale_y_continuous(breaks = c(-1, 0, 1,5,10,15)) +
+#     geom_text_repel(max.overlaps = 100, color = "red") + 
+#     theme(legend.position = "none") +
+#     geom_abline(slope = 1, color = "red") + 
+#     geom_hline(yintercept = 0, color = "blue") + 
+#     geom_vline(xintercept = 0, color = "green") +
+#     labs(title = "The effect of PD in 3rd vs 4th DS", subtitle = "In the jmo")
+
+#One of the other things that can noticed is that there are much more up-regulated genes than downregulated, for both DS. And, despite there is no super good correlation, at least the mayority of the genes falls in the correlated quadrants, In opposition to what is seen with the jmo data. At least this last point is seen for the up-regulated genes.
+
+```
+
+
+#### Get the replicates specific genes:
+
+We will identify genes that differ more between replicates than between conditions.
+To do so, we will use the effect measure of the replicate in each condition, average it and calculate the ratio of this 'replicate' average against an equivalent 'condition' average. We will tag as `genes_replicate_specific` the genes whose ratio is above or equal from 1 (1 will be equivalent effects of replicate and condition). However, since this still doesn't get rid of genes that could be anticorrelated between replicates (because maybe the treatment effect is slightly bigger than the replicate effect), we will also add a filter to explicitly avoid those cases.
+
+
+
+```{r}
+FCmat_treat <- inner_join(res[["eff_PD_jmo_4th"]], res[["eff_PD_jmo_3rd"]], by = c("Gene", "padj"), suffix =  c("4th", "3rd")) %>% mutate(mean_log2FC_treat = (abs(log2FoldChange3rd) + abs(log2FoldChange4th))/2)
+FCmat_orig <- inner_join(res[["eff_orig_Ctrl"]], res[["eff_orig_PD"]], by = c("Gene", "padj"), suffix =  c("Ctrl", "PD")) %>% mutate(mean_log2FC_orig = (abs(log2FoldChangeCtrl) + abs(log2FoldChangePD))/2)
+FCmat <- inner_join(FCmat_treat, FCmat_orig, by = c("Gene", "padj")) %>% mutate(ratio_orig_treat =  mean_log2FC_orig/mean_log2FC_treat) %>% filter(ratio_orig_treat >= 1| (log2FoldChange3rd * log2FoldChange4th) < 0)
+genes_replicate_specific <- FCmat$Gene
+```
+
+There are `r length(genes_replicate_specific)` replicate specific genes.
+
+
+
+By this method `hSNCA-A53T` is selected as a replicate_specific_gene
+```{r}
+grep("hSNCA-A53T", genes_replicate_specific, value = T)
+```
+
+
+
+
+
+
+## Identification of `genes_replicate_specific`
+
+Now plot the correlation of effects for DE genes but color the
+`genes_replicate_specific` (2nd method) and also plot without those
+genes
+
+In every case I am coloring/eliminating the same subset of genes.
+
+#### In jmo, the effect of PD in 3rd vs. 4th DS:
+
+```{r}
+FCmat <- inner_join(res[["eff_PD_jmo_4th"]], res[["eff_PD_jmo_3rd"]], by = c("Gene", "padj"), suffix =  c("4th", "3rd"))
+  #FCmat <- FCmat %>% filter(padj <= 0.05, Gene != "Eif2s3y")
+  FCmat %>% ggplot(aes(x = log2FoldChange4th, y = log2FoldChange3rd, color = Gene %in% genes_replicate_specific)) + 
+    geom_point(alpha = 0.2) +
+    geom_abline(slope = 1, color = "red") + 
+    geom_hline(yintercept = 0, color = "blue") + 
+    geom_vline(xintercept = 0, color = "green") +
+    labs(title = "The effect of PD in 3rd vs 4th DS", subtitle = paste0("In the ", j))
+```
+
+A lot of genes are `genes_replicate_specific`, the mayority of which correspond to the genes that falls in negative values of log2FoldChanges for the 3rdDS
+
+#### In jmo, the effect of PD in 3rd vs. 4th DS but without replicate specific genes:
+
+```{r}
+FCmat_official <- inner_join(res[["eff_PD_jmo_4th"]], res[["eff_PD_jmo_3rd"]], by = c("Gene", "padj"), suffix =  c("4th", "3rd")) %>% filter(!(Gene %in% genes_replicate_specific))
+  FCmat <- FCmat_official %>% filter(padj <= 0.05) 
+  FCmat %>% ggplot(aes(x = log2FoldChange4th, y = log2FoldChange3rd)) + 
+    geom_point(alpha = 0.2) +
+    geom_abline(slope = 1, color = "red") + 
+    geom_hline(yintercept = 0, color = "blue") + 
+    geom_vline(xintercept = 0, color = "green") +
+    labs(title = "The effect of PD in 3rd vs 4th DS", subtitle = "In the jmo", caption = "no replicate specific genes")
+
+filter(FCmat_official, !(Gene %in% c()))  %>% write_csv(paste0("Outputs/", date, "_FCmat_official_CoeffEffect_clust", m, "_", j, "_LC.csv"))
+```
+
+I can see more clearly that the mayority of the gees fall in the correlated quadrants.
+
+## Volcano plots
+
+Note that we are still seeing the effect of the PD treatment at the
+level of the lineal estimator, not the log2FC.
+
+```{r}
+res[["eff_PD_jmo_3rd"]] %>% FCfun3(0.5, 0.05, c(), min = -2.5, max =  2.5) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 3rd DS")
+
+    res[["eff_PD_jmo_4th"]] %>% FCfun3(0.5, 0.05, c(), min = -2.5, max =  2.5) +
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 4th DS")
+
+```
+
+Also, I am ploting the genes that doesn't fall in `genes_replicate_specific` group and only labeling the genes that doesn't fall in the `genes_replicate` group.
+
+```{r}
+res[["eff_PD_jmo_3rd"]] %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun3(0.5, 0.05, c(), min = -7, max = 7) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 3rd DS", caption = "no replicate specific genes")
+
+    res[["eff_PD_jmo_4th"]] %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun3(0.5, 0.05, c(), min = -7, max = 7) +
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 4th DS", caption = "no replicate specific genes")
+
+```
+
+I can see in another way that there are much more upregulated than downregulated genes for each DS.
+
+#### If I only label the genes that agree with these conditions but also have in both replicates a PD effect above 0.5, I get:
+
+```{r}
+     Genes3rd <- res[["eff_PD_jmo_3rd"]] %>% filter(!(Gene %in% genes_replicate_specific), padj <= 0.05, abs(log2FoldChange) > 0.5)
+     Genes3rd <- Genes3rd$Gene
+     Genes4th <- res[["eff_PD_jmo_4th"]] %>% filter(!(Gene %in% genes_replicate_specific), padj <= 0.05, abs(log2FoldChange) > 0.5)
+     Genes4th <- Genes4th$Gene
+     CommonGenes <- Genes3rd[Genes3rd %in% Genes4th]
+     CommonGenes <- CommonGenes[!(CommonGenes %in% c())]
+     
+res[["eff_PD_jmo_3rd"]] %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun5(0.5, 0.05, CommonGenes, min = -7, max = 7) +
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 3rd DS", caption = "no replicate specific genes")
+
+    res[["eff_PD_jmo_4th"]] %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun5(0.5, 0.05, CommonGenes, min = -7, max = 7) +
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 4th DS", caption = "no replicate specific genes")
+    
+    genes_effect_concidently_05_005 <- CommonGenes
+```
+
+However there are a lot of genes differntially expresed, just a few are common between both DS.
+
+#### If I draw the Volcano plots but with a lower effect threshold:
+
+```{r}
+res[["eff_PD_jmo_3rd"]] %>% FCfun3(0.3, 0.05, c(), min = -2.5, max =  2.5) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 3rd DS")
+
+    res[["eff_PD_jmo_4th"]] %>% FCfun3(0.3, 0.05, c(), min = -2.5, max =  2.5) +
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 4th DS")
+
+```
+
+```{r}
+res[["eff_PD_jmo_3rd"]] %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun3(0.3, 0.05, c(), min = -7, max = 7) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 3rd DS", caption = "no replicate specific genes")
+
+    res[["eff_PD_jmo_4th"]] %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun3(0.3, 0.05, c(), min = -7, max = 7) +
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 4th DS", caption = "no replicate specific genes")
+    
+    genes_ontology_effect <- FCmat %>% filter(!(Gene %in% c())) %>% arrange(padj)
+```
+
+And if I repeat it but only labeling genes that have in both replicates a PD effect above 0.3
+
+```{r}
+     Genes3rd <- res[["eff_PD_jmo_3rd"]] %>% filter(!(Gene %in% genes_replicate_specific), padj <= 0.05, abs(log2FoldChange) > 0.3)
+     Genes3rd <- Genes3rd$Gene
+     Genes4th <- res[["eff_PD_jmo_4th"]] %>% filter(!(Gene %in% genes_replicate_specific), padj <= 0.05, abs(log2FoldChange) > 0.3)
+     Genes4th <- Genes4th$Gene
+     CommonGenes <- Genes3rd[Genes3rd %in% Genes4th]
+     CommonGenes <- CommonGenes[!(CommonGenes %in% c())]
+     
+res[["eff_PD_jmo_3rd"]] %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun5(0.3, 0.05, CommonGenes, min = -7, max = 7) +
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 3rd DS", caption = "no replicate specific genes")
+
+    res[["eff_PD_jmo_4th"]] %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun5(0.3, 0.05, CommonGenes, min = -7, max = 7) +
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 4th DS", caption = "no replicate specific genes")
+```
+
+
+Just lowering the effect threshold a little bit, I can get much more genes consistently differntially expressed in both DS.
+
+## Using the "correct" log2FC calculation
+
+Now let's switch from calculating and comparing the effect of PD
+treatments to compare the log2FC of PD treatments in differnt
+conditions. Then plot the correlation between the log2FC and the effect
+(log2FoldChange) measures.
+
+To do this, we are retrieving the coefficients (in the lineal estimator
+scale) for the 4th and the 3rd DS and then we exponentiate "2" to each of them
+(to have them on the predictor scale, because the link function is logarithm of 2) and calculate the log2 of their
+ratio.
+
+Unfold the code to see the script for retrieving each of the them.
+
+#### log2FC of PD/Ctrl in jmo 3rd:
+
+```{r}
+PD <- coef(SceLC)[,c("Intercept", "Treat_PD_vs_Ctrl" )] %>%   rowSums()
+  Ctrl <- coef(SceLC)[,c("Intercept")]
+  log2FC <- log2(2^(PD)/2^(Ctrl))
+  FC_df <- data.frame(log2FC, Gene = rownames(coef(SceLC)))
+  FC_df_jmo_3rd <- inner_join(res[["eff_PD_jmo_3rd"]], FC_df)
+  GeneLab <- if_else(FC_df_jmo_3rd$Gene == "hSNCA-A53T", "hSNCA-A53T", "NA")
+  GeneLab[GeneLab == "NA"] <- NA
+  FC_df_jmo_3rd$GeneLab <- GeneLab
+  
+  FC_df_jmo_3rd %>% ggplot(aes( x= log2FC, y = log2FoldChange, color = Gene == "hSNCA-A53T", label = GeneLab)) + 
+    geom_point(alpha = 1) +
+    scale_color_manual(values = c("black", "red")) +
+    geom_text_repel(max.overlaps = 100, color = "red") + 
+    theme(legend.position = "none")
+```
+
+As we can see, the correlation perfect
+
+#### log2FC of PD/Ctrl in jmo 4th:
+
+```{r}
+PD <- coef(SceLC)[,c("Intercept", "orig.ident_.4th._vs_.3rd.", "Treat_PD_vs_Ctrl" , "orig.ident.4th..TreatPD" )] %>% rowSums()
+  Ctrl <- coef(SceLC)[,c("Intercept", "orig.ident_.4th._vs_.3rd.")] %>% rowSums()
+  log2FC <- log2(2^(PD)/2^(Ctrl))
+  FC_df <- data.frame(log2FC, Gene = rownames(coef(SceLC)))
+  FC_df_jmo_4th <- inner_join(res[["eff_PD_jmo_4th"]], FC_df)
+  GeneLab <- if_else(FC_df_jmo_4th$Gene == "hSNCA-A53T", "hSNCA-A53T", "NA")
+  GeneLab[GeneLab == "NA"] <- NA
+  FC_df_jmo_4th$GeneLab <- GeneLab
+  
+  FC_df_jmo_4th %>% ggplot(aes( x= log2FC, y = log2FoldChange, color = Gene == "hSNCA-A53T", label = GeneLab)) + geom_point(alpha = 1) +
+    scale_color_manual(values = c("black", "red")) +
+    geom_text_repel(max.overlaps = 100, color = "red") + 
+    theme(legend.position = "none")
+```
+
+## And now calculate the replicate specific log2FC
+
+Unfold the code to see the script for retrieving each of the them.
+
+Replicate specific log2FC in jmo Ctrl:
+
+```{r, echo = T}
+# Replicate specific log2FC in jmo Ctrl
+  r4th <- coef(SceLC)[,c("Intercept", "orig.ident_.4th._vs_.3rd.")] %>% rowSums()
+  r3rd <- coef(SceLC)[,c("Intercept")]
+  log2FC <- log2(2^(r4th)/2^(r3rd))
+  FC_df <- data.frame(log2FC, Gene = rownames(coef(SceLC)))
+  FC_df_jmo_ctrl <- inner_join(res[["eff_orig_Ctrl"]], FC_df)
+```
+
+Replicate specific log2FC in jmo PD:
+
+```{r, echo = T}
+  # Replicate specific log2FC in jmo PD
+  r4th <- coef(SceLC)[,c("Intercept", "orig.ident_.4th._vs_.3rd.", "Treat_PD_vs_Ctrl", "orig.ident.4th..TreatPD")] %>% rowSums()
+  r3rd <- coef(SceLC)[,c("Intercept", "Treat_PD_vs_Ctrl")] %>% rowSums()
+  log2FC <- log2(2^(r4th)/2^(r3rd))
+  FC_df <- data.frame(log2FC, Gene = rownames(coef(SceLC)))
+  FC_df_jmo_PD <- inner_join(res[["eff_orig_PD"]], FC_df)
+```
+
+## Plot the correlation of log2FC for DE genes
+
+#### In jmo, the log2FC of PD/Ctrl in 4th vs. 3rd DS:
+
+```{r}
+FCmat <- inner_join(FC_df_jmo_4th, FC_df_jmo_3rd, by = c("Gene", "padj"), suffix =  c("4th", "3rd"))
+  #FCmat <- FCmat %>% filter(padj <= 0.05)
+  
+  GeneLab <- if_else(FCmat$Gene == "hSNCA-A53T", "hSNCA-A53T", "NA")
+  GeneLab[GeneLab == "NA"] <- NA
+  FCmat %>% ggplot(aes(x = log2FC4th, y = log2FC3rd, label = GeneLab, color = Gene == "hSNCA-A53T")) + geom_point(alpha = 0.2) +
+    scale_color_manual(values = c("black", "red")) +
+    geom_text_repel(max.overlaps = 100, color = "red") + 
+    theme(legend.position = "none") +
+    geom_abline(slope = 1, color = "red") + 
+    geom_hline(yintercept = 0, color = "blue") + 
+    geom_vline(xintercept = 0, color = "green") +
+    labs(title = "The effect of PD in 3rd vs 4th DS", subtitle = paste0("In the ", j))
+  
+  #pos_genes <- filter(FCmat, log2FC4th > 10, log2FC3rd > 10, pvalue4th <= 0.05)$Gene
+```
+
+Similar as before, which makes sense since the before measure was a transformation of this and viceversa.
+
+### Get the replicates specific genes:
+
+We will identify genes that differ more between replicates than between conditions.
+To do so, we will use the effect measure of the replicate in each condition, average it and calculate the ratio of this 'replicate' average against an equivalent 'condition' average. We will tag as [`]genes_replicate_specific[`] the genes whose ratio is above or equal from 1 (1 will be equivalent effects of replicate and condition). However, since this still doesn't get rid of genes that could be anticorrelated between replicates (because maybe the treatment effect is slightly bigger than the replicate effect), we will also add a filter to explicitly avoid those cases.
+
+```{r}
+FCmat_treat <- inner_join(FC_df_jmo_4th, FC_df_jmo_3rd, by = c("Gene", "padj"), suffix =  c("4th", "3rd")) %>% mutate(mean_log2FC_treat = (abs(log2FC3rd) + abs(log2FC4th))/2)
+FCmat_orig <- inner_join(FC_df_jmo_ctrl, FC_df_jmo_PD, by = c("Gene", "padj"), suffix =  c("Ctrl", "PD")) %>% mutate(mean_log2FC_orig = (abs(log2FCCtrl) + abs(log2FCPD))/2)
+FCmat <- inner_join(FCmat_treat, FCmat_orig, by = c("Gene", "padj")) %>% mutate(ratio_orig_treat  =  mean_log2FC_orig/mean_log2FC_treat) %>% filter(ratio_orig_treat >= 5| (log2FC3rd * log2FC4th) < 0)
+genes_replicate_specific <- FCmat$Gene
+```
+
+There are `r length(genes_replicate_specific)` replicate specific genes.
+
+By this method `hSNCA-A53T` is selected as a
+`replicate_specific_gene`
+
+```{r}
+grep("hSNCA-A53T", genes_replicate_specific, value = T)
+```
+
+
+
+## Identification of `genes_replicate_specific`
+
+Now plot the correlation of effects for DE genes but color the
+`genes_replicate_specific` and also plot without those genes.
+
+#### In jmo, the log2FC of PD in 3rd vs. 4th DS:
+
+```{r}
+FCmat <- inner_join(FC_df_jmo_4th, FC_df_jmo_3rd, by = c("Gene", "padj"), suffix =  c("4th", "3rd"))
+  #FCmat <- FCmat %>% filter(padj <= 0.05)
+  FCmat %>% ggplot(aes(x = log2FC4th, y = log2FC3rd, color = Gene %in% genes_replicate_specific)) + geom_point(alpha = 0.2) +
+    geom_abline(slope = 1, color = "red") + 
+    geom_hline(yintercept = 0, color = "blue") + 
+    geom_vline(xintercept = 0, color = "green") +
+    labs(title = "The effect of PD in 3rd vs 4th DS", subtitle = paste0("In the ", j))
+```
+
+More genes are `genes_replicate_specific` than before (and as seen before most of them are further away from the red line (line of "perfect correlation"))
+
+#### In jmo, the log2FC of PD in 3rd vs. 4th DS but without replicate specific genes:
+
+```{r}
+FCmat_official <- inner_join(FC_df_jmo_4th, FC_df_jmo_3rd, by = c("Gene", "padj"), suffix =  c("4th", "3rd")) %>%  filter(!(Gene %in% genes_replicate_specific))
+  #FCmat <- FCmat_official %>% filter(padj <= 0.05)
+  FCmat <- FCmat_official
+  FCmat %>% ggplot(aes(x = log2FC4th, y = log2FC3rd)) + 
+    geom_point(alpha = 0.2) +
+    geom_abline(slope = 1, color = "red") + 
+    geom_hline(yintercept = 0, color = "blue") + 
+    geom_vline(xintercept = 0, color = "green") +
+    labs(title = "The effect of PD in 3rd vs 4th DS", subtitle = paste0("In the ", j), caption = "no replicate specific genes")
+  
+filter(FCmat_official, !(Gene %in% c()))  %>% write_csv(paste0("Outputs/", date, "_FCmat_official_log2FC_clust", m, "_", j, "_LC.csv"))
+
+FCmat_official_full <- inner_join(FC_df_jmo_4th, FC_df_jmo_3rd, by = c("Gene", "padj"), suffix =  c("4th", "3rd"))
+FCmat_official_full %>% write_csv(paste0("Outputs/", date, "_FCmat_official_full_log2FC_clust", m, "_", j, "_LC.csv"))
+```
+
+There are still enough genes in the correlated quadrants.
+
+## Volcano plots
+
+#### Threshold in padj-value = 0.05:
+
+```{r}
+FC_df_jmo_3rd %>% FCfun2(0.5, 0.05, c(), min = -20, max =  20) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 3rd DS")
+
+    FC_df_jmo_4th %>% FCfun2(0.5, 0.05, c(), min = -20, max =  20) +
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 4th DS")
+
+```
+
+```{r}
+    FC_df_jmo_3rd %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun2(0.5, 0.05, c(), min = -20, max = 20) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 3rd DS", caption = "no replicate specific genes")
+
+    FC_df_jmo_4th %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun2(0.5, 0.05, c(), min = -20, max = 20) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 4th DS", caption = "no replicate specific genes")
+```
+
+However there are more `replicate_specic_genes` there are still a lot of differntially expressed genes in both DS.
+
+If I repeat it but only labeling genes that have in both replicates a PD effect above 0.5
+
+```{r}
+     Genes3rd <- FC_df_jmo_3rd %>% filter(!(Gene %in% genes_replicate_specific), padj <= 0.05, abs(log2FC) > 0.5)
+     Genes3rd <- Genes3rd$Gene
+     Genes4th <- FC_df_jmo_4th %>% filter(!(Gene %in% genes_replicate_specific), padj <= 0.05, abs(log2FC) > 0.5)
+     Genes4th <- Genes4th$Gene
+     CommonGenes <- Genes3rd[Genes3rd %in% Genes4th]
+     CommonGenes <- CommonGenes[!(CommonGenes %in% c())]
+     
+     FC_df_jmo_3rd %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun4(0.5, 0.05, CommonGenes, min = -20, max = 20) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 3rd DS", caption = "no replicate specific genes")
+
+     FC_df_jmo_4th %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun4(0.5, 0.05, CommonGenes, min = -20, max = 20) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 4th DS", caption = "no replicate specific genes")
+     
+     genes_log2FC_concidently_05_005 <- CommonGenes
+```
+
+
+I can see that there are a lot of common genes between both DS! Much more than the number obtained using the other measure of effect.
+
+If I use a lower log2FC threshold:
+
+```{r}
+FC_df_jmo_3rd %>% FCfun2(0.3, 0.05, c(), min = -20, max =  20) + 
+    labs(title = paste0("The log2FC of PD in the ", j), subtitle = "In the 3rd DS")
+
+    FC_df_jmo_4th %>% FCfun2(0.3, 0.05, c(), min = -20, max =  20) +
+    labs(title = paste0("The log2FC of PD in the ", j), subtitle = "In the 4th DS")
+
+```
+
+```{r}
+    FC_df_jmo_3rd %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun2(0.3, 0.05, c(), min = -20, max = 20) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 3rd DS", caption = "no replicate specific genes")
+
+    FC_df_jmo_4th %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun2(0.3, 0.05, c(), min = -20, max = 20) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 4th DS", caption = "no replicate specific genes")
+    
+    genes_ontology_log2FC <- FCmat %>% arrange(padj)
+```
+
+Looks like if there were more genes in common.
+
+If I repeat it but only labeling genes that have in both replicates a PD effect above 0.3
+
+```{r}
+     Genes3rd <- FC_df_jmo_3rd %>% filter(!(Gene %in% genes_replicate_specific), padj <= 0.05, abs(log2FC) > 0.3)
+     Genes3rd <- Genes3rd$Gene
+     Genes4th <- FC_df_jmo_4th %>% filter(!(Gene %in% genes_replicate_specific), padj <= 0.05, abs(log2FC) > 0.3)
+     Genes4th <- Genes4th$Gene
+     CommonGenes <- Genes3rd[Genes3rd %in% Genes4th]
+     CommonGenes <- CommonGenes[!(CommonGenes %in% c())]
+     
+     FC_df_jmo_3rd %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun4(0.3, 0.05, CommonGenes, min = -20, max = 20) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 3rd DS", caption = "no replicate specific genes")
+
+     FC_df_jmo_4th %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun4(0.3, 0.05, CommonGenes, min = -20, max = 20) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 4th DS", caption = "no replicate specific genes")
+```
+
+There is effectively more genes, including some downregulated genes.
+
+#### Threshold in padj-value = 0.1:
+
+To see if there are more coincidence between replicates, but this
+doesn't seem to be the case.
+
+```{r}
+   FC_df_jmo_3rd %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun2(0.5, 0.1, c(), min = -20, max = 20) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 3rd DS", caption = "no replicate specific genes")
+
+     FC_df_jmo_4th %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun2(0.5, 0.1, c(), min = -20, max = 20) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 4th DS", caption = "no replicate specific genes")
+
+```
+
+If I repeat it but only labeling genes that have in both replicates a PD effect above 0.5
+
+```{r}
+     Genes3rd <- FC_df_jmo_3rd %>% filter(!(Gene %in% genes_replicate_specific), padj <= 0.1, abs(log2FC) > 0.5)
+     Genes3rd <- Genes3rd$Gene
+     Genes4th <- FC_df_jmo_4th %>% filter(!(Gene %in% genes_replicate_specific), padj <= 0.1, abs(log2FC) > 0.5)
+     Genes4th <- Genes4th$Gene
+     CommonGenes <- Genes3rd[Genes3rd %in% Genes4th]
+     CommonGenes <- CommonGenes[!(CommonGenes %in% c())]
+     
+     FC_df_jmo_3rd %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun4(0.5, 0.1, CommonGenes, min = -20, max = 20) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 3rd DS", caption = "no replicate specific genes")
+
+     FC_df_jmo_4th %>% filter(!(Gene %in% genes_replicate_specific)) %>% FCfun4(0.5, 0.1, CommonGenes, min = -20, max = 20) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 4th DS", caption = "no replicate specific genes")
+```
+
+There is not much more genes in common, but I have some downregulated genes.
+
+## Conclusions:
+
+The measure of log2FC is the same as the log2FoldChange, so DESeq2 is doing things right. I was confused before, because I think the logarithm DESeq2 was using was de natural log, but the paper stands " For notational simplicity, the equations here use the natural logarithm as the link function, though the DESeq2 software reports estimated model coefficients and their estimated standard errors on the log2 scale." (https://doi.org/10.1186/s13059-014-0550-8) 
+
+I am using a softer sense of replicate specific genes, that don't penalize a lot genes that have low size effects
+
+What I should do is to take the genes which have a padj value <= 0.05 filtering out `genes_replicate_specific` and uncorrelated genes `genes_replicate` (this table is saved on "Outputs/DATE_FCmat_official_log2FC_clustM_J.csv") to do a post-hoc analysis, only evaluating the "Treat" effect to get a unique "averaged" log2FC with a padj value that evaluate this differnce.
+
+In case I would want to target genes based just on this metric, I would
+take into account the genes which have a padj value <= 0.05 and log2FC greater than 0.5 for both replicates (`genes_log2FC_concidently_05_005`), which is:
+`r paste0(genes_log2FC_concidently_05_005, collapse = " ")`.
+
+The top 50 genes (by padj) without considering replicate specific genes neither uncorrelated are:
+
+```{r}
+genes_ontology_log2FC %>% DT::datatable(filter = "top")
+```
+
+```{r}
+saveRDS(genes_replicate_specific, paste0("Outputs/", date, "_genes_replicate_specific_clust", m, "_", j, "_LC.rds"))
+```
+
+
+```{r, include = FALSE}
+#rm(list = ls())
+#gc()
+```

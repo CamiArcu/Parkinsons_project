@@ -1,0 +1,2725 @@
+---
+title: "QC Analysis and Integration 4th DataSet prolijo final"
+author: "Camila Arcuschin; Ignacio Schor"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: cerulean
+    code_folding: hide
+    toc: true
+editor_options: 
+  markdown: 
+    wrap: 72
+bibliography: references.bib
+---
+
+```{r setup, include=T}
+knitr::opts_chunk$set(message = FALSE, echo = TRUE, warning = FALSE)
+knitr::opts_knit$set(root.dir = "/data_husihuilke/shared/SMB/carcu/Parkinsons_project/")
+```
+
+```{r importpckg, include=T}
+library(Seurat)
+library(tidyverse)
+library(hdf5r)
+library(pryr)
+library(gridExtra)
+library(grid)
+library(ragg) # scaling plots
+library(reticulate)
+library(patchwork)
+library(cowplot)
+library(viridis)
+library(future) # parallel processing
+library(scran)
+library(scDblFinder)
+library(scater)
+RhpcBLASctl::blas_set_num_threads(3)
+plan(multisession, workers = 5)
+options(future.globals.maxSize = 4000 * 1024^2)
+#py_install("pandas")
+wd = "/data_husihuilke/shared/SMB/carcu/Parkinsons_project/"
+```
+
+```{r Functions, include =T}
+#### Functions ####
+
+# Create Seurat Object and filter by UMIs.p.cell and ribosomal percentage
+Seu_filter <-
+  function(dataX,
+           UMIs.p.cell_lth,
+           UMIs.p.cell_hth,
+           percent.rb_th,
+           treatment) {
+    # Implement some filter parameters to avoid working with a very big matrix
+    # Gene must be expressed in at least 30 cell (of the 2452867 "cells")
+    # Explore the data, rename the cells metadata
+    GetAssayData(dataX)
+    dataX[[]] %>% str()
+    dataX@meta.data <-
+      rename(dataX@meta.data, "nFeature_RNA" = "ActiveGenes.p.cell")
+    dataX@meta.data <-
+      mutate(dataX@meta.data, "UMIs.p.cell" = nCount_RNA)
+    #Add MetaData
+    is.ribo <-
+      lapply(c("Rpl", "Rps"), function(x)
+        grepl(x, rownames(dataX))) %>% unlist()
+    ribo_genes <-
+      lapply(c("Rpl", "Rps"), function(x)
+        grep(x, rownames(dataX), value = T)) %>% unlist()
+    ribo_umis <- GetAssayData(dataX)[ribo_genes,] %>% colSums()
+    dataX[["percent.rb"]] <- 100 * ribo_umis / dataX$UMIs.p.cell
+    dataX[["percent.mt"]] <-
+      PercentageFeatureSet(dataX, pattern = "Mt")
+    # What would happen if I only kept the cell with more than 2000 UMIs (aprox remove the 7% of the distribution)
+    dataX <-
+      subset(
+        dataX,
+        subset = UMIs.p.cell > UMIs.p.cell_lth &
+          UMIs.p.cell < UMIs.p.cell_hth & percent.rb < percent.rb_th
+      )
+    return(dataX)
+  }
+
+get_legend <- function(myggplot) {
+  tmp <- ggplot_gtable(ggplot_build(myggplot))
+  leg <- which(sapply(tmp$grobs, function(x)
+    x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)
+}
+
+# Log Normalize Seurat and select the 2000 most variable genes
+norm_seurat <- function(all_samples) {
+  all_samples <-
+    NormalizeData(all_samples,
+                  normalization.method = "LogNormalize",
+                  scale.factor = 10000)
+  all_samples <-
+    FindVariableFeatures(
+      all_samples,
+      selection.method = "vst",
+      nfeatures = 2000,
+      loess.span = 0.6
+    )
+}
+
+# Run PCA, knn and UMAP
+UMAP_maker <- function(obj, dims, k.param) {
+  ScaleData(object = obj) %>%
+    RunPCA(npcs = dims) %>%
+    FindNeighbors(dims = 1:dims, k.param = k.param) %>% #Esta linea no har?a falta, igual creo que no cambiar?a nada porque siempre lo estoy pisando.
+    RunUMAP(dims = 1:dims)
+} # The reason why I have FindNeighbours here is because, if I want to replot UMAP whithout changing the cluster already assigned, I could do it
+
+preprocess_RPCA <- function(obj.list, features) {
+  obj.list <- ScaleData(object = obj.list, features = features) %>%
+    RunPCA(features = features)
+}
+
+fisher <- function(x) {
+  matriz <- matrix(c(x[1], x[2], x[3], x[4]), nrow = 2)
+  f_test <- fisher.test(matriz)
+  data_fisher <-
+    c(enrich = f_test[["estimate"]][["odds ratio"]],
+      p_val = f_test[["p.value"]],
+      conf_int = f_test[["conf.int"]])
+  return(data_fisher)
+}
+
+create_random <- function(To, p_E, p_S, p_N){
+  vec <- sample(c("EGFP", "SNCA", "EGFP_SNCA", "Neith"), To,  replace = T, prob = c(p_E-p_E*p_S, p_S-p_E*p_S, p_E*p_S, p_N))
+  table(vec)
+}
+
+
+EGFP_SNCA <- function(df) {
+  nrow(filter(df, `EGFP` == 1 & `hSNCA` == 1))
+}
+
+EGFP <- function(df) {
+  nrow(filter(df, `EGFP` == 1 & `hSNCA` == 0))
+}
+
+SNCA <- function(df) {
+  nrow(filter(df, `EGFP` == 0 & `hSNCA` == 1))
+}
+
+Neith <- function(df) {
+  nrow(filter(df, `EGFP` == 0 & `hSNCA` == 0))
+}
+
+label2analyze <- function(FishTest){
+  vect <- c()
+  for (i in 1:length(clusters2analyze)){
+    if (i != 3){
+      vect[i] <- paste0("Cluster ", clusters2analyze[i], " = ", round(FishTest["enrich", clusters2analyze[i]], 2), " (p-adj = ", format(FishTest["FDR", clusters2analyze[i]], digits=3), ") ; ")
+    } else {
+      vect[i] <- paste0("Cluster ", clusters2analyze[i], " = ", round(FishTest["enrich", clusters2analyze[i]], 2), " (p-adj = ", format(FishTest["FDR", clusters2analyze[i]], digits=3), ") ;\n")
+    }
+  }
+  return(vect)
+}
+
+# Plotting
+my_theme <- theme_classic() +
+  theme(
+    plot.title = element_text(size = 25, face = "bold"),
+    axis.text.x = element_text(colour = "black", size = 14),
+    axis.text.y = element_text(colour = "black", size = 14),
+    legend.title = element_text(size = 15),
+    legend.text = element_text(size = 15),
+    axis.title.y = element_text(size = 15),
+    axis.title.x = element_text(size = 15),
+    strip.text.x = element_text(size = 15)
+  )
+
+QC_plots <- function(SeuObj, extra_text, n_color) {
+  Dist_QC <-
+    VlnPlot(
+      SeuObj,
+      features = c(
+        "ActiveGenes.p.cell",
+        "UMIs.p.cell",
+        "percent.mt",
+        "percent.rb"
+      ),
+      ncol = 4,
+      pt.size = 0,
+      cols = n_color
+    ) &
+    theme(legend.position = "none",
+          axis.title = element_text(size = 6),
+          axis.text = element_text(size = 5),
+          plot.title = element_text(size = 8, face = "bold"))
+  stth <-     theme(
+    legend.position = "none",
+    axis.title = element_text(size = 6),
+    axis.text = element_text(size = 5),
+    plot.title = element_text(size = 8, face = "bold")
+  )
+  plot1 <-
+    FeatureScatter(
+      SeuObj,
+      feature1 = "UMIs.p.cell",
+      feature2 = "percent.mt",
+      pt.size = 0.5,
+      plot.cor =  F,
+      cells = sample(Cells(SeuObj)),
+      cols = n_color
+    ) + stth
+  plot2 <-
+    FeatureScatter(
+      SeuObj,
+      feature1 = "UMIs.p.cell",
+      feature2 = "ActiveGenes.p.cell",
+      pt.size = 0.5,
+      plot.cor =  F,
+      cells = sample(Cells(SeuObj)),
+      cols = n_color
+    ) + stth
+  plot3 <-
+    FeatureScatter(
+      SeuObj,
+      feature1 = "ActiveGenes.p.cell",
+      feature2 = "percent.rb",
+      pt.size = 0.5,
+      plot.cor =  F,
+      cells = sample(Cells(SeuObj)),
+      cols = n_color
+    )+ stth
+  plot4 <-
+    FeatureScatter(
+      SeuObj,
+      feature1 = "UMIs.p.cell",
+      feature2 = "percent.rb",
+      pt.size = 0.5,
+      plot.cor =  F,
+      cells = sample(Cells(SeuObj)),
+      cols = n_color
+    ) + stth
+  Scat_QC <-
+    plot_grid(plot1, plot2, plot3, plot4, nrow = 1)
+  QC_plot <- (Dist_QC / Scat_QC) +
+    plot_annotation(
+      title = paste0(
+        extra_text,
+        "Quality Control Metrics for > ",
+        UMIs.p.cell_lowthreshold,
+        " <",
+        UMIs.p.cell_highthreshold,
+        " UMI < ",
+        percent.rb_threshold,
+        " per.rb Matrix (",
+        dim(SeuObj)[2],
+        " Cells)"
+      ),
+      subtitle = "each number is a cluster",
+      theme = theme(
+        axis.text = element_text(size = 5),
+        axis.title = element_text(size = 6),
+        plot.title = element_text(size = 8, face = "bold")
+      )
+    )
+  return(QC_plot)
+}
+
+UMAP_by_clust <-
+  function(SeuObj,
+           ClusterBreaks,
+           ClusterLabels,
+           pt_size,
+           title_text,
+           subtitle_text,
+           color_a,
+           color_b,
+           do_label,
+           n_color) {
+    (
+      UMAPa <-
+        DimPlot(
+          SeuObj,
+          reduction = "umap",
+          label = do_label,
+          pt.size = pt_size
+        ) +
+         scale_colour_manual(values = n_color, breaks = ClusterBreaks, labels = ClusterLabels) +
+        labs(
+          title = title_text,
+          subtitle = subtitle_text
+          # color = color_a
+        ) +
+        theme(
+          axis.title = element_text(size = 6),
+          legend.title = element_text(size = 6),
+          legend.text = element_text(size = 6),
+          legend.position = "bottom",
+          plot.title = element_text(size = 10, face = "bold"), axis.text = element_text(size = 0), axis.ticks = element_line(size = 0)
+        ) +
+        guides(color = guide_legend(
+          title.position="top",
+          override.aes = list(size = 1), nrow = 3
+        ))
+    )
+    (
+      UMAPb <-
+        DimPlot(
+          SeuObj,
+          reduction = "umap",
+          label = F,
+          pt.size = pt_size,
+          group.by = "Treat",
+          cells = sample(Cells(SeuObj))
+        ) +
+        labs(
+          title = "",
+          subtitle = "",
+          color = color_b
+        ) +
+        theme(
+          legend.position = "right",
+          axis.title = element_text(size = 6),
+          legend.title = element_text(size = 6),
+          legend.text = element_text(size = 6),
+          plot.title = element_text(size = 10, face = "bold"), axis.text = element_text(size = 0), axis.ticks = element_line(size = 0)
+        ) +
+        guides(color = guide_legend(
+          override.aes = list(size = 1), nrow = 2
+        ))
+    )
+    return(list("UMAPa" = UMAPa, "UMAPb" = UMAPb))
+  }
+
+insert_minor <- function(major_labs, n_minor) {
+  labs <-
+    c(sapply(major_labs, function(x)
+      c(x, rep("", 4))))
+  labs[1:(length(labs) - n_minor)]
+}
+
+UMAPs_for_grid <- function(SeuObj, subtitle_text) {
+  Idents(SeuObj) <- "Genes"
+  UMAP4 <-
+    DimPlot(
+      SeuObj,
+      reduction = "umap",
+      order = T,
+      label = F,
+      pt.size = 1,
+      label.size = 8,
+      ncol = 1,
+      cols = c("grey", "#40a1e4", "#e48340", "#4c0e97")
+    ) +
+    labs(title = "", subtitle = "EGFP-KASH+ hSNCA-A53T+ Cells") + theme(legend.position = "top") +
+    guides(color = guide_legend(override.aes = list(size = 4), nrow = 1))
+  legend <- get_legend(UMAP4)
+  UMAP4 <- UMAP4 + theme(legend.position = "none")
+  Idents(SeuObj) <- "seurat_clusters"
+  UMAPa <-
+    DimPlot(SeuObj,
+            reduction = "umap",
+            pt.size = 0.7,
+            label = F,
+            cols = colors_n) + theme(legend.position = "none")
+  UMAPa_edit <-
+    LabelClusters(UMAPa,
+                  id = "ident",
+                  size = 4,
+                  repel = F) + labs(title = "", subtitle = subtitle_text) +
+    theme(title = element_text(size = 15))
+  return(list(
+    "UMAP4_split" = UMAP4,
+    "UMAPa_edit" = UMAPa_edit,
+    "UMAP4_legend" = legend
+  ))
+}
+
+
+FeaturePlotMultiple2 <-
+  function(obj, feature, color, ord, alf, minlim) {
+    # # the minimal and maximal of the value to make the legend scale the same.
+    # minimal<- min(obj[['RNA']]@data[feature, ])
+    # maximal<- max(obj[['RNA']]@data[feature, ])
+    ps <- vector("list", length(feature))
+    for (i in 1:length(feature)) {
+      if (ord) {
+        p <-
+          FeaturePlot(
+            obj,
+            features = feature[i],
+            min.cutoff = minlim,
+            max.cutoff = "q99",
+            pt.size = 0.00001,
+            cols = c(alpha("lightgrey", alf), alpha(color[i], alf)),
+            order = T
+          )
+      } else {
+        p <-
+          FeaturePlot(
+            obj,
+            features = feature[i],
+            min.cutoff = minlim,
+            max.cutoff = "q99",
+            pt.size = 0.00001,
+            cols = c(alpha("lightgrey", alf), alpha(color[i], alf)),
+            cells = sample(Cells(obj))
+          )
+      }
+      #ggtitle(feature[i]) + theme_void() +
+      p <-
+        p + theme(
+          text = element_text(size = 6),
+          axis.text = element_text(size = 2.7),
+          plot.title = element_text(size = 10, face = "bold"),
+          legend.position = "none"
+        )
+      plot_name <- feature[i]
+      ps[[i]] <- p
+      names(ps)[[i]] <- plot_name
+    }
+    return(ps)
+  }
+```
+
+```{r ImportInput, include = T, echo = T}
+## Date ##
+#date = 221102 # La corrida anterior que estaba todo ok y prolija (la ultima del 3rdDS)
+#date = 230522 # La corrida que va a sacar intra-samples doublets con el  dbfinddoublets filter
+#date = 230523 # La corrida que va a sacar intra-samples doublets con el  demuxhto filter
+ # date = 230601 # La corrida que va a sacar intra-samples doublets con el dbfinddoublets filter 4thDS
+# date = 230602 # La corrida que va a sacar intra-samples doublets con el dbfinddoublets filter 3rdDS
+
+
+date = 231122 #corrida con filter before 4thDS
+numDS = "4th"
+equiv_values_Treat = c("PD", "PD", "Ctrl", "Ctrl") # 4thDS
+equiv_values_Age = c("1mo" , "2mo", "2mo", "1mo") # 4thDS
+colors_hash = c("#C77CFF", "#00BFC4", "#D39200", "#F8766D")
+clusters2analyze = c(0,1,2,3,4,7,10) %>% as.character()
+text4stackbar = c(0,1,2,4,5,6,7) %>% as.character()
+text4stackbarEGFP = c(0,5,8,10,13,16) %>% as.character()
+FilePath = "Data/230601/SCC0117_Briese_LC_custom/outs/" # la corrida del 4thDS
+datadate = "230601 LC"
+cluster_map = c(6, 10, 11, 9, 12) %>% as.character()
+
+# date = 231122 #corrida con filter before 3rdDS
+# numDS = "3rd"
+# equiv_values_Treat = c("PD", "Ctrl", "Ctrl", "PD")
+# equiv_values_Age = c("1mo" , "1mo", "2mo", "2mo")
+# colors_hash = c("#C77CFF", "#F8766D", "#D39200", "#00BFC4")
+# clusters2analyze = c(0:11)
+# text4stackbar = c(0,1,2,3,4,5,8,9) %>% as.character()
+# text4stackbarEGFP = c(0,2,5,10) %>% as.character()
+# FilePath = "Data/221017/SCC0109_PD_Ctrl_Custom/SCC0109_PD_Ctrl/outs/" # la corrida del 3rdDS
+# datadate = "221017 LC"
+# cluster_map = c(6, 8, 10, 7) %>% as.character()
+```
+
+**Extra data to take into account:**
+
+From 10x CellRanger:
+
+-   "Our internal tests have shown the recovery of Single Cell
+    populations between whole cells and nuclei is comparable. In some
+    cases, there are advantages to using single nuclei for RNA-seq,
+    including reducing biases in cell populations and this is explained
+    here.
+
+-   "Please also read the technote on resolving cell types as a function
+    of Read Depth and Cell Number here"
+
+-   HTO Analysis:
+
+    -   "If you also used antibody-based hashtag oligos (HTOs) for
+        sample multiplexing, you may use the [multi pipeline in Cell
+        Ranger
+        6+](https://kb.10xgenomics.com/hc/en-us/articles/4407386498957-I-used-antibody-tags-for-cell-surface-protein-capture-and-cell-hashing-with-Single-Cell-3-chemistry-How-can-I-use-Cell-Ranger-to-analyze-my-data-)
+
+## Data
+
+Data used belong to the download from the `r datadate`. Reads have been
+mapped to the mouse transcriptome plus transgenes incorporated:
+KASH-EGFP and aSyn-A53T. Cells are pre-filetered by total UMI counts
+(see the web_summary.html on the same folder).
+
+```{r ImportInputReal, include = T}
+## File Path/Name ####
+FileName = "filtered_feature_bc_matrix.h5"
+```
+
+```{r include = T}
+print("loading data") # Load the data and convert it into a Seurat Object
+data <-
+  Read10X_h5(paste0(FilePath, FileName),
+             use.names = TRUE,
+             unique.features = TRUE)
+dim(data$`Gene Expression`) # 32285 7379 (date = 221102) #32285 22047 (date = 230522)
+```
+
+## Demultiplexing cells
+
+The Seurat HTODemux function for demultiplexing HashTag antibody
+associated Oligonucleotide (HTO) works by generating k clusters (with
+k-medoids) of the cells based on the normalized HTO expression values
+(being k = number of unique HTOs + 1 for the Negative group). Then, it
+calculates the average expression values per cluster and assign the
+Negative class to the cluster with the lowest expression. Within the
+Negative cluster, it fits a Negative Binomial distribution for each HTO
+and assign the 0.99 quantile of that distribution as a threshold for the
+positivity or negativity of each HTO in each cell. Cells which are
+positive for more than 1 HTO are classified as doublets.
+
+```{r Demultiplex, include = T}
+SeuObjRaw <-
+  CreateSeuratObject(
+    counts = data$`Gene Expression`,
+    project = "FACSHash",
+    min.cells = 0,
+    min.features = 0
+  ) # Create Seurat Object
+SeuObjRaw[["HTO"]] <-
+  CreateAssayObject(counts = data$`Antibody Capture`) # Add HTO assay
+SeuObjRaw <-
+  NormalizeData(SeuObjRaw, assay = "HTO", normalization.method = "CLR") # Normalize data
+SeuObjRaw <-
+  HTODemux(SeuObjRaw, assay = "HTO", positive.quantile = 0.99) # Demultiplex HTO according to HTO expression. I tried with kfunc =  "kmeans" but results doesn't chamge tht much and I lost 10 more cells
+rm(data)
+```
+
+```{r include= T}
+gc()
+```
+
+### Distribution of the summed HTO expression of each sample, according to hash.ID classification:
+
+The line in red shows a threshold for the intra-sample doublets defined
+by expression.
+
+```{r RidgePlot_HTO_class}
+RidgePlot_HTO_class <-
+  RidgePlot(
+    SeuObjRaw,
+    assay = "HTO",
+    features = "nCount_HTO" ,
+    log = TRUE,
+    ncol = 1
+  )# Distribution of counts of negative, singlet or doublet classification.
+RidgePlot_HTO_class <-
+  RidgePlot_HTO_class + geom_vline(xintercept = 5000, colour = "red")
+RidgePlot_HTO_class
+```
+
+### Distribution of each HTO raw expression:
+
+```{r RidgePlot_HTO_expr, fig.asp=1.5, out.height= '25%'}
+feat <- rownames(GetAssayData(SeuObjRaw[["HTO"]]))
+Idents(SeuObjRaw) <- "all_cells"
+RidgePlot_HTO_expr <-
+  RidgePlot(
+    SeuObjRaw,
+    slot = "counts",
+    assay = "HTO",
+    features = feat,
+    log = T,
+    ncol = 1
+  )# Distribution of counts of negative, singlet or doublet classification.
+RidgePlot_HTO_expr <-
+  RidgePlot_HTO_expr & geom_vline(xintercept = 800, colour = "red")
+RidgePlot_HTO_expr
+```
+
+### Distribution of the summed HTO expression of each cell:
+
+```{r RidgePlot_HTO_tgth, out.height= '25%', fig.asp=0.5}
+RidgePlot_HTO_tgth <-
+  RidgePlot(
+    SeuObjRaw,
+    assay = "HTO",
+    features = "nCount_HTO" ,
+    log = TRUE,
+    ncol = 1
+  )# Distribution of counts of negative, singlet or doublet classification.
+RidgePlot_HTO_tgth <-
+  RidgePlot_HTO_tgth + geom_vline(xintercept = 5000, colour = "red")
+RidgePlot_HTO_tgth
+```
+
+### Distribution of the summed RNA expression of each cell type, according to being doublets, singlets or negatives:
+
+```{r VlnPlot_HTO_global}
+Idents(SeuObjRaw) <- "HTO_classification.global"
+VlnPlot_HTO_global <-
+  VlnPlot(SeuObjRaw,
+          features = "nCount_RNA",
+          pt.size = 0,
+          log = TRUE) # Distribution of counts of negative, singlet or doublet classification.
+VlnPlot_HTO_global
+```
+
+#### How many cells corresponds to each category?
+
+```{r HTO_classification, include = T}
+HTO_classification <-
+  c(
+    "singlet" = length(
+      which(SeuObjRaw@meta.data$"HTO_classification.global" == "Singlet")
+    ),
+    "doublet" = length(
+      which(SeuObjRaw@meta.data$"HTO_classification.global" == "Doublet")
+    ),
+    "negative" = length(
+      which(
+        SeuObjRaw@meta.data$"HTO_classification.global" == "Negative"
+      )
+    )
+  )
+print(HTO_classification)
+```
+
+## Discard negative -low counts- cells and analyze cells clustering by HTOs expression
+
+Heatmap is done with HTO scaled expression
+
+```{r HTOHeatmapAndTSNE}
+SeuRaw_noNeg <- subset(SeuObjRaw, idents = "Negative", invert = TRUE)
+rm(SeuObjRaw)
+
+# Analize cells clustering by HTOs expression
+DefaultAssay(SeuRaw_noNeg) <- "HTO"
+SeuRaw_noNeg <-
+  ScaleData(SeuRaw_noNeg,
+            features = rownames(SeuRaw_noNeg),
+            verbose = FALSE)
+SeuRaw_noNeg <-
+  RunPCA(
+    SeuRaw_noNeg,
+    features = rownames(SeuRaw_noNeg),
+    approx = F,
+    ndims.print = 1:2
+  ) # RunPCA by default uses an approximate algorithm (irlba) for computing the PCs.
+SeuRaw_noNeg <- RunTSNE(SeuRaw_noNeg, dims = 1:4, perplexity = 100)
+tSNEPlot_HTO <-
+  DimPlot(SeuRaw_noNeg, group.by = "hash.ID") # Plot UMAP, doublets colored in pink
+tSNEPlot_HTO
+HTOHeatmap <-
+  HTOHeatmap(SeuRaw_noNeg,
+             assay = "HTO",
+             ncells = 5000,
+             raster = F) # Plot HeatMap or each HTO level by cell in singlets and doublets
+HTOHeatmap
+```
+
+```{r include = T}
+gc()
+```
+
+#### Calculate the proportion of intra-sample doublets:
+
+Given the fact that all the library preparation was done pooling
+together cells from all samples with the HTO previously added, the
+probability of a sample to match another sample is $1/(2^n)$, in which
+$n$ is the number of samples. That gives a probability of $1/16$, in
+which from this 16 cases only 4 corresponds to a self match (an
+intra-sample doublet) and 12 to a non-self match (an inter-sample
+doublet). This means there are 12 cases detected by the different HTO
+expression in the same "cell/nuclei" but 4 cases undetected by this
+method, that gives $1/3$ of the detected doublet cases ("known
+doublets"). If there are `r HTO_classification["doublet"]` known
+doublets, I would expect to have approx
+`r HTO_classification["doublet"]`/3 =
+`r HTO_classification["doublet"]/3`
+
+```{r ExpressionDoublets, include= T}
+possibleDoublet <-
+  data.frame(hash.ID = as.character(SeuRaw_noNeg@meta.data$hash.ID)) %>% mutate(hash.ID.changed = if_else(SeuRaw_noNeg@meta.data$nCount_HTO > 5000, "Doublet", hash.ID))
+rownames(possibleDoublet) <- NULL
+SeuRaw_noNeg@meta.data$possibleDoublet <-
+  possibleDoublet$hash.ID.changed %>% as.factor()
+```
+
+HeatMaps of each HTO expression only for cells assigned as doublets, including intra- and inter-sample doublets
+
+```{r HTOHeatmap_known_and_expression_doublets, include=T}
+#HeatMaps of each HTO expression only for cells assigned as doublets, including intra- and inter-sample doublets
+HTOHeatmap_doublets <-
+  HTOHeatmap(
+    subset(SeuRaw_noNeg, subset = possibleDoublet == "Doublet") ,
+    assay = "HTO",
+    ncells = 5000,
+    raster = F
+  ) #, ncells = 5000)
+HTOHeatmap_doublets
+```
+
+#### How many cells are intra-sample doublets identified by HTO expression?
+
+There are
+`r dim(subset(SeuRaw_noNeg, subset = possibleDoublet == "Doublet" & hash.ID != "Doublet"))[2]`
+cells
+
+Plot the HeatMaps of each HTO expression only for cells assigned as Doublets, intra- and inter-sample, but with the hash.ID classification
+
+```{r HTOHeatmap_doublets_classification, include=T}
+# Plot the HeatMaps of each HTO expression only for cells assigned as Doublets, intra- and inter-sample, but with the hash.ID classification
+Idents(SeuRaw_noNeg) <- "hash.ID"
+HTOHeatmap_doublets <-
+  DoHeatmap(
+    subset(SeuRaw_noNeg, subset = possibleDoublet == "Doublet") ,
+    slot = "scale.data",
+    assay = "HTO",
+    features = feat
+  ) #, ncells = 5000)
+HTOHeatmap_doublets
+#I can see graphically that approx 1/3 of the inter-treatment doublets could be intra-treatment doublets
+```
+
+## Apply the *scDblFinder* method to find intra-sample doublets by guilty association with inter-sample doublets
+
+The method do the following:
+
+-   Uses the PCA space to get the *k* nearest neighbors of each cell
+    that are known doublets.
+
+-   Also it pre-classifies cells by its more expressed HTO and estimate
+    the proportion of cells in this categories.
+
+-   Then it uses the number of *k* nearest -known doublets- neighbors
+    that belong to the cell category and calculate a score of a
+    "proportion of doublets" for each cell. As higher the proportion,
+    higher the probability of that cell for being also a doublet.
+
+-   A threshold of that score is determined to get all the doublets and
+    the known doublets are excluded to identified the "predicted"
+    intra-sample doublets.
+
+    For more info see
+    [here](http://bioconductor.org/books/3.15/OSCA.advanced/doublet-detection.html)
+    or
+    [here](http://www.bioconductor.org/packages/release/bioc/vignettes/scDblFinder/inst/doc/recoverDoublets.html)
+
+```{r dbFindDoublet, include = T}
+UMIs.p.cell_lowthreshold = 0
+UMIs.p.cell_highthreshold = Inf
+percent.rb_threshold = Inf
+
+DefaultAssay(SeuRaw_noNeg) <- "RNA"
+SeuRaw_noNeg <-
+  Seu_filter(
+    SeuRaw_noNeg,
+    UMIs.p.cell_lth = UMIs.p.cell_lowthreshold,
+    UMIs.p.cell_hth = UMIs.p.cell_highthreshold,
+    percent.rb_th = percent.rb_threshold,
+    treatment = "Gene Expression"
+  )
+SeuRaw_noNeg <- norm_seurat(SeuRaw_noNeg)
+SeuRaw_noNeg <- FindVariableFeatures(SeuRaw_noNeg)
+SeuRaw_noNeg <-
+  UMAP_maker(SeuRaw_noNeg, dims = 50, k.param = 10)
+SeuRaw_noNeg <-
+  RunTSNE(SeuRaw_noNeg,
+          dims = 1:4,
+          perplexity = 100)
+SeuRaw_noNeg <-
+  FindNeighbors(
+    SeuRaw_noNeg,
+    dims = 50,
+    k.param = 10,
+    compute.SNN = F
+  )
+SeuRaw_noNeg <-
+  FindClusters(
+    SeuRaw_noNeg,
+    resolution = 0.05,
+    n.start = 100,
+    n.iter = 10
+  )
+
+sce.hash <-
+  as.SingleCellExperiment(DietSeurat(SeuRaw_noNeg, graphs = c("pca", "tsne", "umap")))
+# Recovering the intra-sample doublets:
+colData(sce.hash)$Doublet <- colData(sce.hash)$hash.ID == "Doublet"
+colData(sce.hash)$Doublet2 <-
+  colData(sce.hash)$hash.ID != "Doublet" &
+  colData(sce.hash)$possibleDoublet == "Doublet"
+hashed.doublets <-
+  recoverDoublets(
+    sce.hash,
+    use.dimred = "PCA",
+    doublets = sce.hash$Doublet,
+    samples = table(sce.hash$HTO_maxID),
+    k = 100
+  )
+hashed.doublets
+set.seed(1000101001)
+sce.hash$proportion <- hashed.doublets$proportion
+sce.hash$predicted <- hashed.doublets$predicted
+```
+
+### UMAP comparing the known, predicted and expression doublets
+
+```{r UMAPSamplePredicted, fig.height= 7}
+p0<-plotUMAP(sce.hash, colour_by = "seurat_clusters") + ggtitle("Clusters")
+p0$layers[[1]]$aes_params$size <- 0.5
+p1 <- plotUMAP(sce.hash, colour_by = "ActiveGenes.p.cell") + ggtitle("Active Genes")
+p1$layers[[1]]$aes_params$size <- 0.5
+p2<-plotUMAP(sce.hash, colour_by = "proportion") + ggtitle("Doublet proportions")
+p2$layers[[1]]$aes_params$size <- 0.5
+p3 <- plotUMAP(sce.hash, colour_by = "Doublet") + ggtitle("Known doublets")
+p3$layers[[1]]$aes_params$size <- 0.5
+
+UMAPSamplePredicted <- plot_grid(
+    p0,
+    p1,
+    p2,
+    p3,
+  ggcells(sce.hash[, order(sce.hash$predicted)]) +
+    geom_point(aes(
+      x = UMAP.1, y = UMAP.2, colour = predicted
+    ), size = 0.5) +
+    scale_color_manual(values = c("grey", "red")) +
+    theme_bw() +
+    ggtitle("Predicted intra-sample doublets"),
+  ggcells(sce.hash[, order(sce.hash$Doublet2)]) +
+    geom_point(aes(
+      x = UMAP.1, y = UMAP.2, colour = Doublet2
+    ), size = 0.5) +
+    scale_color_manual(values = c("grey", "blue")) +
+    theme_bw() +
+    ggtitle("Expression intra-sample doublets"),
+  ncol = 2
+)
+UMAPSamplePredicted
+```
+
+### tSNE comparing the known, predicted and expression doublets
+
+```{r tSNESamplePredicted,  out.width= '150%', out.height= '75%', fig.asp=0.7}
+tSNESamplePredicted <- plot_grid(
+  plotTSNE(sce.hash, colour_by = "proportion") + ggtitle("Doublet proportions"),
+  plotTSNE(sce.hash, colour_by = "Doublet") + ggtitle("Known doublets"),
+  ggcells(sce.hash[, order(sce.hash$predicted)]) +
+    geom_point(aes(
+      x = TSNE.1, y = TSNE.2, colour = predicted
+    )) +
+    scale_color_manual(values = c("grey", "red")) +
+    theme_bw() +
+    ggtitle("Predicted intra-sample doublets"),
+  ggcells(sce.hash[, order(sce.hash$Doublet2)]) +
+    geom_point(aes(
+      x = TSNE.1, y = TSNE.2, colour = Doublet2
+    )) +
+    scale_color_manual(values = c("grey", "blue")) +
+    theme_bw() +
+    ggtitle("Expression intra-sample doublets"),
+  ncol = 2
+)
+tSNESamplePredicted
+```
+
+### "Proportion of doublets" score for each state: predicted, known and singlet
+
+```{r hashed.doublets_vln}
+state <-
+  ifelse(
+    hashed.doublets$predicted,
+    "predicted",
+    ifelse(hashed.doublets$known, "known", "singlet")
+  )
+colData(sce.hash) <- cbind(colData(sce.hash), state)
+ggplot(as.data.frame(hashed.doublets)) + geom_violin(aes(x = state, y =
+                                                           proportion))
+```
+
+#### How many *scDblFinder* intra-sample doublets belong to each of the categories obtained by intra-sample doublets found by HTO expression?
+
+```{r expressionVspredicted, include=TRUE}
+table(sce.hash$possibleDoublet, sce.hash$predicted)
+# FALSE TRUE
+# Doublet      5940  314
+# LC-Ctrl-1mo  2638  530
+# LC-Ctrl-2mo  1528  225
+# LC-PD-1mo    2283  316
+# LC-PD-2mo    1973  329
+# Negative        0    0
+```
+
+#### How many doublets are ...:
+
+-   predicted intra-sample, but not known inter-sample and also
+    expression intra- and inter-sample:
+    `r length(which(colData(sce.hash)$possibleDoublet == "Doublet" & colData(sce.hash)$hash.ID != "Doublet" & colData(sce.hash)$predicted == T))`
+
+-   predicted intra-sample, but not known inter-sample:
+    `r length(which(colData(sce.hash)$hash.ID != "Doublet" & colData(sce.hash)$predicted == T))`
+
+-   predicted intra-sample and also expression intra- and inter-sample:
+    `r length(which(colData(sce.hash)$possibleDoublet == "Doublet" & colData(sce.hash)$predicted == T))`
+
+-   predicted intra-sample:
+    `r length(which(colData(sce.hash)$predicted == T))`
+
+-   expression intra- and -inter sample:
+    `r length(which(colData(sce.hash)$possibleDoublet == "Doublet"))`
+
+-   known inter-sample:
+    `r length(which(colData(sce.hash)$hash.ID == "Doublet"))`
+
+#### How many cells for each singlet, inter-sample (known) and intra-sample (predicted)
+
+```{r totalDoublets, include = T}
+print(table(sce.hash$state))
+```
+
+```{r save_sce.hash_object, include = FALSE}
+## Save the sce Object
+#saveRDS(sce.hash, paste0("Outputs/", date, "_sce.hash_", numDS, "DataSet.rds"))
+```
+
+```{r sce2Seurat, include = T}
+## sce to Seurat
+SeuRaw_noNeg <-
+  as.Seurat(sce.hash, counts = "counts", data = "logcounts") #no deja que se agregue automaticamente el scale.data que estaba en sce.hash (como assays(sce.hash)[["scaledata"]]), dice que no lo tiene en cuenta. Igual despues no lo necesito porque uso el assay de RNA y no mas el de HTO
+DefaultAssay(SeuRaw_noNeg) <- "RNA"
+rm(sce.hash)
+```
+
+```{r include=T}
+ gc()
+```
+
+## Analyzing cells using RNA assay
+
+### Do intra- or -inter sample cells have higher ribosomal percentage?
+
+```{r hashed.doublets_vln_perc.rb}
+ggcells(as.SingleCellExperiment(SeuRaw_noNeg)) + geom_violin(aes(x = state, y =
+                                                                   percent.rb))
+```
+
+```{r save_RawNoNeg_object, include = FALSE}
+#saveRDS(SeuRaw_noNeg, paste0("Outputs/", date, "_SeuRaw_noNeg_", numDS, "DataSet.rds"))
+```
+
+## Keep singlets and intra-sample doublets
+
+```{r singlet_intra.sample_doublets}
+SeuObj.singlet <-
+  subset(SeuRaw_noNeg, subset = hash.ID != "Doublet") # (date = 230524)
+rm(SeuRaw_noNeg)
+```
+
+Dim of the object is `r dim(SeuObj.singlet)`\`
+
+```{r include = F}
+gc()
+```
+
+## Analyze data without integration
+
+In the "predicted" plot, blue point are predicted intra-sample doublets
+
+```{r, include=T}
+SeuObj.singlet.merge <- FindVariableFeatures(SeuObj.singlet)
+SeuObj.singlet.merge@reductions <- list()
+SeuObj.singlet.merge <-
+  UMAP_maker(SeuObj.singlet.merge, dims = 50, k.param = 10)
+SeuObj.singlet.merge <-
+  RunTSNE(SeuObj.singlet.merge,
+          dims = 1:4,
+          perplexity = 100)
+SeuObj.singlet.merge <-
+  FindNeighbors(
+    SeuObj.singlet.merge,
+    dims = 50,
+    k.param = 10,
+    compute.SNN = F
+  )
+SeuObj.singlet.merge <-
+  FindClusters(
+    SeuObj.singlet.merge,
+    resolution = 0.05,
+    n.start = 100,
+    n.iter = 10
+  )
+```
+
+```{r, include = T}
+#Add meaning to HTO as metadata columns
+equiv_table <-
+  data.frame(
+    hash.ID = unique(SeuObj.singlet.merge@meta.data$hash.ID),
+    Treat = equiv_values_Treat,
+    Age = equiv_values_Age,
+    colors = colors_hash
+  )
+cols_hash <- equiv_table$colors
+names(cols_hash) <- equiv_table$hash.ID
+print("this is equiv table")
+equiv_table
+new_meta_data <-
+  left_join(select(SeuObj.singlet.merge@meta.data,  "seurat_clusters", "hash.ID") ,
+            equiv_table)
+SeuObj.singlet.merge@meta.data$Treat <- new_meta_data$Treat
+SeuObj.singlet.merge@meta.data$Age <- new_meta_data$Age
+```
+
+```{r DimplotAssay, out.width= '150%', out.height= '70%', fig.asp=0.45}
+colors_n <- rainbow(length(unique(SeuObj.singlet.merge@meta.data$seurat_clusters)))
+names(colors_n) <- unique(SeuObj.singlet.merge@meta.data$seurat_clusters)
+
+UMAP.singletA <-
+  DimPlot(SeuObj.singlet.merge,
+          group.by = "hash.ID",
+          cells = sample(Cells(SeuObj.singlet.merge)),
+          cols = cols_hash) # Hacer que el orden de aparicion de celulas sea aleatorio
+UMAP.singletB <-
+  DimPlot(SeuObj.singlet.merge,
+          group.by = "seurat_clusters",
+          cells = sample(Cells(SeuObj.singlet.merge)),
+          cols =  colors_n)
+## Plot which are predicted doublets:
+UMAP.singletC <-
+  DimPlot(SeuObj.singlet.merge, group.by = "predicted", order = T)
+(UMAP.singletA +  UMAP.singletB + UMAP.singletC) &
+  theme(legend.position = "none")
+tSNE.singletA <-
+  DimPlot(
+    SeuObj.singlet.merge,
+    reduction = "tsne",
+    group.by = "hash.ID",
+    cells = sample(Cells(SeuObj.singlet.merge)),
+    cols = cols_hash
+  ) + # Hacer que el orden de aparicion de celulas sea aleatorio
+guides(color = guide_legend(nrow = 4, override.aes = list(size=3)))
+tSNE.singletB <-
+  DimPlot(
+    SeuObj.singlet.merge,
+    reduction = "tsne",
+    group.by = "seurat_clusters",
+    cells = sample(Cells(SeuObj.singlet.merge)),
+    cols =  colors_n
+  )
+## Plot which are predicted doublets:
+tSNE.singletC <-
+  DimPlot(SeuObj.singlet.merge,
+          reduction = "tsne",
+          group.by = "predicted", order = T)
+(tSNE.singletA +  tSNE.singletB + tSNE.singletC) &
+  theme(legend.position = "bottom", legend.key.size = unit(0.1, "cm"))
+
+SeuObj.singlet.merge$CouldBeADouble <- ifelse(SeuObj.singlet.merge$seurat_clusters %in% cluster_map, T, F)
+```
+
+
+```{r, include=TRUE}
+# ElbowPlot(SeuObj.singlet.merge, ndims = 50)
+obj_dims = 30 # Dimensions to use
+d <-
+  stats::dist(Embeddings(SeuObj.singlet.merge, reduction = "pca")[, 1:obj_dims], method = "euclidean") # Create Matrix of Euclidean distances between all pair cells
+# There are 2 type of reductions to use: "pca" and "umap". "pca" reduction has 50 dimensions while "umap" reduction has 2 dimensions. Since clustering is based on "pca" reductions, we will use "pca" reductions to get the silhoutte score. Despite everthing, UMAP is just a method to vizualize what is hoded on the 50 PCAs. But lets double check in the Seurat Paper and in my presentations if the Clustering use UMAP reduction
+batches <-
+  tibble(CellNames = dimnames(SeuObj.singlet.merge)[[2]],
+         Batch = SeuObj.singlet.merge@meta.data$hash.ID) # Set the Batch correspondence to each cell
+batches <- mutate(batches, Batch_int = as.numeric(as.factor(Batch)))
+sil_batch <-
+  cluster::silhouette(x = batches$Batch_int - 1, dist = d) # Calculate SW for batch effect for each cell
+rm(batches, d)
+ASW_batch <-
+  mean(tibble::as_tibble(sil_batch[,])$sil_width) # Calculate the Average Silhoutte 
+```
+
+#### The ASW (Average Silhouette Width) batch score (integration quality parameter) for the non integrated data is `r round(ASW_batch, 4)`
+
+```{r, include=TRUE}
+# ElbowPlot(SeuObj.singlet.merge, ndims = 50)
+SeuObj.singlet.merge_b <- subset(SeuObj.singlet.merge, subset = Treat == "Ctrl")
+obj_dims = 30 # Dimensions to use
+d <-
+  stats::dist(Embeddings(SeuObj.singlet.merge_b, reduction = "pca")[, 1:obj_dims], method = "euclidean") # Create Matrix of Euclidean distances between all pair cells
+# There are 2 type of reductions to use: "pca" and "umap". "pca" reduction has 50 dimensions while "umap" reduction has 2 dimensions. Since clustering is based on "pca" reductions, we will use "pca" reductions to get the silhoutte score. Despite everthing, UMAP is just a method to vizualize what is hoded on the 50 PCAs. But lets double check in the Seurat Paper and in my presentations if the Clustering use UMAP reduction
+batches <-
+  tibble(CellNames = dimnames(SeuObj.singlet.merge_b)[[2]],
+         Batch = SeuObj.singlet.merge_b@meta.data$hash.ID) # Set the Batch correspondence to each cell
+batches <- mutate(batches, Batch_int = as.numeric(as.factor(Batch)))
+sil_batch <-
+  cluster::silhouette(x = batches$Batch_int - 1, dist = d) # Calculate SW for batch effect for each cell
+rm(batches, d)
+ASW_batch <-
+  mean(tibble::as_tibble(sil_batch[,])$sil_width) # Calculate the Average Silhoutte 
+```
+
+#### The ASW (Average Silhouette Width) batch score (integration quality parameter) for the non integrated data ONLY on Ctrl samples (different months as "replicates" of clusterization) is `r round(ASW_batch, 4)`
+
+
+## Keep only singlets
+
+```{r, include=T}
+SeuObj.singlet.merge <-
+  subset(SeuObj.singlet.merge, subset = state == "singlet") # (date = 230524)
+SeuObj.singlet.merge <- FindVariableFeatures(SeuObj.singlet.merge)
+SeuObj.singlet.merge <- UMAP_maker(SeuObj.singlet.merge, dims = 50, k.param = 10)
+SeuObj.singlet.merge <- RunTSNE(SeuObj.singlet.merge, dims = 1:4, perplexity = 100)
+SeuObj.singlet.merge <-
+  FindNeighbors(SeuObj.singlet.merge,
+                dims = 50,
+                k.param = 10,
+                compute.SNN = F)
+SeuObj.singlet.merge <-
+  FindClusters(SeuObj.singlet.merge,
+               resolution = 0.05,
+               n.start = 100,
+               n.iter = 10)
+```
+
+```{r, out.width= '150%', out.height= '70%', fig.asp=0.45}
+colors_n <- rainbow(length(unique(SeuObj.singlet.merge@meta.data$seurat_clusters)))
+names(colors_n) <- unique(SeuObj.singlet.merge@meta.data$seurat_clusters)
+
+UMAP.singletA <-
+  DimPlot(SeuObj.singlet.merge,
+          group.by = "hash.ID",
+          cells = sample(Cells(SeuObj.singlet.merge)),
+          cols = cols_hash) # Hacer que el orden de aparicion de celulas sea aleatorio
+UMAP.singletB <-
+  DimPlot(SeuObj.singlet.merge,
+          group.by = "seurat_clusters",
+          cells = sample(Cells(SeuObj.singlet.merge)),
+          cols =  colors_n)
+## Plot which are predicted doublets:
+UMAP.singletC <-
+  DimPlot(SeuObj.singlet.merge, group.by = "predicted", order = T)
+(UMAP.singletA +  UMAP.singletB + UMAP.singletC) &
+  theme(legend.position = "none")
+tSNE.singletA <-
+  DimPlot(
+    SeuObj.singlet.merge,
+    reduction = "tsne",
+    group.by = "hash.ID",
+    cells = sample(Cells(SeuObj.singlet.merge)),
+    cols = cols_hash
+  ) + # Hacer que el orden de aparicion de celulas sea aleatorio
+  guides(color = guide_legend(nrow = 4, override.aes = list(size=3)))
+tSNE.singletB <-
+  DimPlot(
+    SeuObj.singlet.merge,
+    reduction = "tsne",
+    group.by = "seurat_clusters",
+    cells = sample(Cells(SeuObj.singlet.merge)),
+    cols =  colors_n
+  ) 
+## Plot which are predicted doublets:
+tSNE.singletC <-
+  DimPlot(SeuObj.singlet.merge,
+          reduction = "tsne",
+          group.by = "predicted", order = T)
+(tSNE.singletA +  tSNE.singletB + tSNE.singletC) &
+  theme(legend.position = "bottom", legend.key.size = unit(0.1, "cm"))
+```
+
+```{r}
+Table_no_filter <- table(SeuObj.singlet.merge$seurat_clusters, SeuObj.singlet.merge$hash.ID)
+Table_no_filter
+```
+
+```{r, include=TRUE}
+# ElbowPlot(SeuObj.singlet.merge, ndims = 50)
+obj_dims = 30 # Dimensions to use
+d <-
+  stats::dist(Embeddings(SeuObj.singlet.merge, reduction = "pca")[, 1:obj_dims], method = "euclidean") # Create Matrix of Euclidean distances between all pair cells
+# There are 2 type of reductions to use: "pca" and "umap". "pca" reduction has 50 dimensions while "umap" reduction has 2 dimensions. Since clustering is based on "pca" reductions, we will use "pca" reductions to get the silhoutte score. Despite everthing, UMAP is just a method to vizualize what is hoded on the 50 PCAs. But lets double check in the Seurat Paper and in my presentations if the Clustering use UMAP reduction
+batches <-
+  tibble(CellNames = dimnames(SeuObj.singlet.merge)[[2]],
+         Batch = SeuObj.singlet.merge@meta.data$hash.ID) # Set the Batch correspondence to each cell
+batches <- mutate(batches, Batch_int = as.numeric(as.factor(Batch)))
+sil_batch <-
+  cluster::silhouette(x = batches$Batch_int - 1, dist = d) # Calculate SW for batch effect for each cell
+rm(batches, d)
+ASW_batch <-
+  mean(tibble::as_tibble(sil_batch[,])$sil_width) # Calculate the Average Silhoutte 
+```
+
+#### The ASW (Average Silhouette Width) batch score (integration quality parameter) for the non integrated data is `r round(ASW_batch, 4)`
+
+```{r, include=TRUE}
+# ElbowPlot(SeuObj.singlet.merge, ndims = 50)
+SeuObj.singlet.merge_b <- subset(SeuObj.singlet.merge, subset = Treat == "Ctrl")
+obj_dims = 30 # Dimensions to use
+d <-
+  stats::dist(Embeddings(SeuObj.singlet.merge_b, reduction = "pca")[, 1:obj_dims], method = "euclidean") # Create Matrix of Euclidean distances between all pair cells
+# There are 2 type of reductions to use: "pca" and "umap". "pca" reduction has 50 dimensions while "umap" reduction has 2 dimensions. Since clustering is based on "pca" reductions, we will use "pca" reductions to get the silhoutte score. Despite everthing, UMAP is just a method to vizualize what is hoded on the 50 PCAs. But lets double check in the Seurat Paper and in my presentations if the Clustering use UMAP reduction
+batches <-
+  tibble(CellNames = dimnames(SeuObj.singlet.merge_b)[[2]],
+         Batch = SeuObj.singlet.merge_b@meta.data$hash.ID) # Set the Batch correspondence to each cell
+batches <- mutate(batches, Batch_int = as.numeric(as.factor(Batch)))
+sil_batch <-
+  cluster::silhouette(x = batches$Batch_int - 1, dist = d) # Calculate SW for batch effect for each cell
+rm(batches, d)
+ASW_batch <-
+  mean(tibble::as_tibble(sil_batch[,])$sil_width) # Calculate the Average Silhoutte 
+```
+
+#### The ASW (Average Silhouette Width) batch score (integration quality parameter) for the non integrated data ONLY on Ctrl samples (different months as "replicates" of clusterization) is `r round(ASW_batch, 4)`
+
+### Color the UMAPs by library size:
+
+The plots differ in how the scale is adjusted.
+
+```{r UMAP_lbsz2,  out.width= '100%', out.height= '75%', fig.asp=1.5}
+thfp <-
+  theme(plot.title = element_text(size = 9), legend.text = element_text(size = 4), axis.text = element_text(size = 4), axis.title = element_text(size = 4))
+fp1 <-
+  FeaturePlot(object = SeuObj.singlet.merge,
+              features = "UMIs.p.cell",
+              cells =  sample(Cells(SeuObj.singlet.merge))) + scale_colour_gradient(low = "lightblue", high = "darkblue") + 
+  labs(title = "All; no lim on lbsz")+ thfp
+
+fp2 <-
+  FeaturePlot(object = SeuObj.singlet.merge,
+              features = "UMIs.p.cell",
+              cells =  sample(Cells(SeuObj.singlet.merge))) + scale_colour_gradient(
+                limits = c(0, 10000),
+                low = "lightblue",
+                high = "darkblue"
+              ) +  labs(title = "All; scale lim to 10000") + thfp
+
+fp3 <-
+  FeaturePlot(object = SeuObj.singlet.merge,
+              features = "UMIs.p.cell",
+              cells =  sample(Cells(SeuObj.singlet.merge))) + scale_colour_gradient(
+                limits = c(0, 20000),
+                low = "lightblue",
+                high = "darkblue"
+              ) + labs(title = "All; scale lim to 20000") +thfp
+
+fp4 <-
+  FeaturePlot(
+    object = subset(SeuObj.singlet.merge, subset = Treat == "Ctrl"),
+    features = "UMIs.p.cell",
+    cells =  sample(Cells(subset(
+      SeuObj.singlet.merge, subset = Treat == "Ctrl"
+    )))
+  ) + scale_colour_gradient(
+    limits = c(0, 20000),
+    low = "lightblue",
+    high = "darkblue"
+  ) + labs(title = "Ctrl; scale lim to 20000") + thfp
+
+fp5 <-
+  FeaturePlot(
+    object = subset(SeuObj.singlet.merge, subset = Treat == "PD"),
+    features = "UMIs.p.cell",
+    cells =  sample(Cells(subset(
+      SeuObj.singlet.merge, subset = Treat == "PD"
+    )))
+  ) + scale_colour_gradient(
+    limits = c(0, 20000),
+    low = "lightblue",
+    high = "darkblue"
+  ) + labs(title = "PD; scale lim to 20000") + thfp
+
+fp6 <-
+  FeaturePlot(
+    object = subset(SeuObj.singlet.merge, subset = Treat == "Ctrl" &
+                      Age == "1mo"),
+    features = "UMIs.p.cell",
+    cells =  sample(Cells(
+      subset(SeuObj.singlet.merge, subset = Treat == "Ctrl" &
+               Age == "1mo")
+    ))
+  ) + scale_colour_gradient(
+    limits = c(0, 20000),
+    low = "lightblue",
+    high = "darkblue"
+  ) + labs(title = "Ctrl 1mo; scale lim to 20000") + thfp
+
+fp7 <-
+  FeaturePlot(
+    object = subset(SeuObj.singlet.merge, subset = Treat == "Ctrl" &
+                      Age == "2mo"),
+    features = "UMIs.p.cell",
+    cells =  sample(Cells(
+      subset(SeuObj.singlet.merge, subset = Treat == "Ctrl" &
+               Age == "2mo")
+    ))
+  ) + scale_colour_gradient(
+    limits = c(0, 20000),
+    low = "lightblue",
+    high = "darkblue"
+  ) + labs(title = "Ctrl 2mo; scale lim to 20000") + thfp
+
+plot_grid(fp1, fp2, fp3, fp4, fp5, fp6, fp7, NULL, ncol = 2)
+```
+
+### Filter-out cells having less that 1000 and more than 60000 UMI counts
+
+I decide not to filter cell for their ribosomal protein content. Here
+are some paper in which the ribosomal proteins were differentially
+expressed in PD. In some papers these genes are up-regulated and in
+other downregulated, depending the case:
+
+-   @garcia-esparcia2015 found 12 Rpl/Rps genes downregulated in SN in
+    stages 3-4
+
+-   @hemmings2022 Found a module of Rpl/Rps genes associated with a PD
+    and PTSD population. Also they cite a paper in which Rpl6 was
+    associated with early onset of PD
+
+-   @jiao2023 have a nice review of ribosome biogenesis
+
+-   @zhong2020 found that Rpl3, Rpl6, Rps27a, Rps29 were up-regulated in
+    a snRNA-seq experiment in the midbrain of a PD mouse
+
+However, cell with higher ribosomal content have also the lowest number
+of active genes. This could be either some sort of bias given by the
+manipulation of cells or maybe those are cells that have some sort of
+metabolic disregulation becaus eof the PD treatment.
+
+```{r, out.width= '100%', out.height= '100%'}
+UMIs.p.cell_lowthreshold = 1000 #2000
+UMIs.p.cell_highthreshold = 60000
+percent.rb_threshold = Inf
+SeuObj.singlet.merge <-
+  subset(
+    SeuObj.singlet.merge,
+    subset = UMIs.p.cell > UMIs.p.cell_lowthreshold &
+      UMIs.p.cell < UMIs.p.cell_highthreshold &
+      percent.rb < percent.rb_threshold
+  )
+
+## Find clusters and color UMAP by clusters with Louvain and a high number of iterations ####
+UMAP.SeuInt1 <-
+  DimPlot(SeuObj.singlet.merge, group.by = "hash.ID", cells = sample(Cells(SeuObj.singlet.merge)), cols = cols_hash) + guides(color = guide_legend(override.aes = list(size = 1), ncol = 2))
+UMAP.SeuInt2 <-
+  DimPlot(SeuObj.singlet.merge, group.by = "seurat_clusters", cols =  colors_n, cells = sample(Cells(SeuObj.singlet.merge)))
+(UMAP.SeuInt1 +  UMAP.SeuInt2) &
+  theme(legend.position = "bottom",
+        legend.key.size = unit(0.1, "cm"))
+
+## Plot QC graphics per cluster ####
+QC_plots(SeuObj.singlet.merge, "", colors_n)
+```
+
+```{r}
+Table_filter <- table(SeuObj.singlet.merge$seurat_clusters, SeuObj.singlet.merge$hash.ID)
+Table_filter
+```
+
+Difference
+```{r}
+Table_filter - Table_no_filter
+```
+
+```{r}
+SeuObj.singlet.merge <- FindVariableFeatures(SeuObj.singlet.merge)
+SeuObj.singlet.merge <- UMAP_maker(SeuObj.singlet.merge, dims = 50, k.param = 10)
+SeuObj.singlet.merge <- RunTSNE(SeuObj.singlet.merge, dims = 1:4, perplexity = 100)
+SeuObj.singlet.merge <-
+  FindNeighbors(SeuObj.singlet.merge,
+                dims = 50,
+                k.param = 10,
+                compute.SNN = F)
+SeuObj.singlet.merge <-
+  FindClusters(SeuObj.singlet.merge,
+               resolution = 0.05,
+               n.start = 100,
+               n.iter = 10)
+```
+
+
+```{r}
+## Find clusters and color UMAP by clusters with Louvain and a high number of iterations ####
+colors_n <- rainbow(length(unique(SeuObj.singlet.merge@meta.data$seurat_clusters)))
+names(colors_n) <- unique(SeuObj.singlet.merge@meta.data$seurat_clusters)
+
+UMAP.SeuInt1_b <-
+  DimPlot(SeuObj.singlet.merge, group.by = "hash.ID", cells = sample(Cells(SeuObj.singlet.merge)), cols = cols_hash) + guides(color = guide_legend(override.aes = list(size = 1), ncol = 2))
+UMAP.SeuInt2_b <-
+  DimPlot(SeuObj.singlet.merge, group.by = "seurat_clusters", cols =  colors_n, cells = sample(Cells(SeuObj.singlet.merge)))
+(UMAP.SeuInt1_b +  UMAP.SeuInt2_b + UMAP.SeuInt2) &
+  theme(legend.position = "bottom",
+        legend.key.size = unit(0.1, "cm"))
+
+## Plot QC graphics per cluster ####
+QC_plots(SeuObj.singlet.merge, "", colors_n)
+```
+
+```{r ASW_batch_noInt, include=TRUE}
+# ElbowPlot(SeuObj.singlet.merge, ndims = 50)
+obj_dims = 30 # Dimensions to use
+d <-
+  stats::dist(Embeddings(SeuObj.singlet.merge, reduction = "pca")[, 1:obj_dims], method = "euclidean") # Create Matrix of Euclidean distances between all pair cells
+# There are 2 type of reductions to use: "pca" and "umap". "pca" reduction has 50 dimensions while "umap" reduction has 2 dimensions. Since clustering is based on "pca" reductions, we will use "pca" reductions to get the silhoutte score. Despite everthing, UMAP is just a method to vizualize what is hoded on the 50 PCAs. But lets double check in the Seurat Paper and in my presentations if the Clustering use UMAP reduction
+batches <-
+  tibble(CellNames = dimnames(SeuObj.singlet.merge)[[2]],
+         Batch = SeuObj.singlet.merge@meta.data$hash.ID) # Set the Batch correspondence to each cell
+batches <- mutate(batches, Batch_int = as.numeric(as.factor(Batch)))
+sil_batch <-
+  cluster::silhouette(x = batches$Batch_int - 1, dist = d) # Calculate SW for batch effect for each cell
+rm(batches, d)
+ASW_batch <-
+  mean(tibble::as_tibble(sil_batch[,])$sil_width) # Calculate the Average Silhoutte 
+```
+
+#### The ASW (Average Silhouette Width) batch score (integration quality parameter) for the non integrated data is `r round(ASW_batch, 4)`
+
+```{r, include=TRUE}
+# ElbowPlot(SeuObj.singlet.merge, ndims = 50)
+SeuObj.singlet.merge_b <- subset(SeuObj.singlet.merge, subset = Treat == "Ctrl")
+obj_dims = 30 # Dimensions to use
+d <-
+  stats::dist(Embeddings(SeuObj.singlet.merge_b, reduction = "pca")[, 1:obj_dims], method = "euclidean") # Create Matrix of Euclidean distances between all pair cells
+# There are 2 type of reductions to use: "pca" and "umap". "pca" reduction has 50 dimensions while "umap" reduction has 2 dimensions. Since clustering is based on "pca" reductions, we will use "pca" reductions to get the silhoutte score. Despite everthing, UMAP is just a method to vizualize what is hoded on the 50 PCAs. But lets double check in the Seurat Paper and in my presentations if the Clustering use UMAP reduction
+batches <-
+  tibble(CellNames = dimnames(SeuObj.singlet.merge_b)[[2]],
+         Batch = SeuObj.singlet.merge_b@meta.data$hash.ID) # Set the Batch correspondence to each cell
+batches <- mutate(batches, Batch_int = as.numeric(as.factor(Batch)))
+sil_batch <-
+  cluster::silhouette(x = batches$Batch_int - 1, dist = d) # Calculate SW for batch effect for each cell
+rm(batches, d)
+ASW_batch <-
+  mean(tibble::as_tibble(sil_batch[,])$sil_width) # Calculate the Average Silhoutte 
+```
+
+#### The ASW (Average Silhouette Width) batch score (integration quality parameter) for the non integrated data ONLY on Ctrl samples (different months as "replicates" of clusterization) is `r round(ASW_batch, 4)`
+
+```{r}
+Table_filter <- table(SeuObj.singlet.merge$seurat_clusters, SeuObj.singlet.merge$hash.ID)
+Table_filter
+```
+
+
+
+```{r DataSummary1, include=F}
+# Data summary
+# print("data summary singlet1")
+# data_summary <-
+#   data.frame(
+#     "value" = c(
+#       "date" = date,
+#       "path" = paste0(wd, FilePath, FileName),
+#       "object_name" = "SeuObj.singlet.merge",
+#       "filtered" = "no",
+#       "nr_cells" = dim(SeuObj.singlet.merge)[2],
+#       "demultiplexed" = "yes",
+#       "demux_positive.quantile" = 0.99,
+#       "norm.meth" =  "CLR",
+#       # Change this if needed
+#       HTO_classification,
+#       "integrated" = "no",
+#       "ASW_batch" = round(ASW_batch, 4) ,
+#       "ASW_dims" = obj_dims,
+#       "nr_clusters" = length(levels(
+#         SeuObj.singlet.merge@meta.data$seurat_clusters
+#       ))
+#     )
+#   ) %>% mutate("vars" = rownames(.), .before = value)  %>% `rownames<-`(NULL)
+# neigh_params <-
+#   SeuObj.singlet.merge$FindNeighbors.RNA.pca@params %>% unlist() %>% as.data.frame() %>% `colnames<-`("value")  %>% mutate("vars" = rownames(.), .before = value)  %>% `rownames<-`(NULL) %>% rbind(data.frame("vars" =  "neigh.params", "value" = NA), .)
+# clust_params <-
+#   SeuObj.singlet.merge$FindClusters@params %>% unlist() %>% as.data.frame() %>% `colnames<-`("value")  %>% mutate("vars" = rownames(.), .before = value)  %>% `rownames<-`(NULL) %>% rbind(data.frame("vars" =  "clust.params", "value" = NA), .)
+# norm_params <-
+#   SeuObj.singlet.merge$NormalizeData.RNA@params %>% unlist() %>% as.data.frame() %>% `colnames<-`("value")  %>% mutate("vars" = rownames(.), .before = value)  %>% `rownames<-`(NULL) %>% rbind(data.frame("vars" =  "norm.params", "value" = NA), .)
+# variabFeat_params <-
+#   SeuObj.singlet.merge$FindVariableFeatures.RNA@params %>% unlist() %>% .[-c(5, 6)] %>% as.data.frame() %>% t() %>% as.data.frame() %>% `colnames<-`("value")  %>% mutate("vars" = rownames(.), .before = value)  %>% `rownames<-`(NULL) %>% rbind(data.frame("vars" =  "varFeat.params", "value" = NA), .)
+# data_summary <-
+#   rbind(data_summary, neigh_params) %>% rbind(clust_params) %>% rbind(norm_params) %>% rbind(variabFeat_params)
+# data_summary
+```
+
+## Integrate Samples
+
+The way to do the integration is the following:
+
+-   Select the features to integrate: this are the joint 2000 top
+    variable features in all samples. The variable features are already
+    computed separately on each sample. Here, features are positively
+    ranked for being variable in all samples at the same time.
+
+-   For each pair of samples, find the pair of cells between them that
+    can match the best in the reduced PCA space (anchors) of each
+    sample. It is like finding the *k* nearest neighborhood of a cell in
+    the PCA projection of the paired sample
+
+-   Do a hierarchical clustering between samples (using a specific
+    distance calculation based on anchors) to get a guide tree to make
+    the integration of a pair of samples. For each pair: Integrate both
+    samples subtracting the expression values of the selected features
+    from one member of the anchor to the other member. Without changing
+    the values of the cells that couldn't be anchored? (mirar
+    anotaciones). A weight is also applied to penalize the distance
+    between each anchor. Repeat these steps using the newly generated
+    matrix and the following sample in the guide tree to integrate.
+
+    In my particular case, I integrated using the selected variable
+    features plus some neuronal, glial, and capilar cell-markers of
+    interest, plus the transgenes.
+
+-   Values for k.anchor, k.filter, k.score, max.features and k.weight
+    are obtained by the ones tested in the @otero-garcia2022 paper DS
+    (from Inma Cobos lab) which retrieved best ASW batch scores (see
+    Alzheimer_project/Scripts/scRNAseq_integration_RCPA_labmeet.html to
+    see the values)
+
+```{r Integrate, include = T}
+print("start integration")
+# Prepare the objects to integrate
+#SeuObj.singlet <- subset(SeuObj.singlet, subset = state == "singlet")
+SeuObj.singlet.split <-
+  SplitObject(SeuObj.singlet.merge, split.by = "hash.ID") # Create a list of Seurat Objects to integrate
+SeuObj.singlet.split <-
+  lapply(SeuObj.singlet.split, norm_seurat) # Normalize and select variable features
+SeuIntFeatures <-
+  SelectIntegrationFeatures(SeuObj.singlet.split, nfeatures = 2000) # Features (genes) to use in the integration
+SeuObj.singlet.split <-
+  lapply(SeuObj.singlet.split, preprocess_RPCA, SeuIntFeatures) # Pre-process data: Scale data and run PCA
+
+# Features to include in the integration (markers of different cell types, including Locus Ceruleus (LC))
+LCmark <-
+  c("Dbh",
+    "Th",
+    "Slc6a2",
+    "Chrna7",
+    "Maoa",
+    "Rlim",
+    "Sec23a",
+    "Ppp2r2d",
+    "Usp34") # Removed markers:  "Adra1a" "Ovgp1", "Smad9", "Gal", "Galr1", "Npy", falta "Galr3" y "Galr2"
+Neuron <- c("Rbfox3") # General neurons
+Ex <- c("Slc17a6", "Slc17a7") # Excitatory neurons
+Inh <- c("Gad1") # Inhibitory neuron
+Astrocytes <- c("Gfap", "Gja1") # Removed markers: Blbp = Fabp7;
+Microglia <- c("C1qb") # Removed markers: Aif1 = Iba1
+OPC <- c("Olig1", "Tnr")
+Oligodendrocyte <- c("Tfrc", "Plp1", "Mbp") # Tfrc = Tfr
+Fibro <- c("Dcn") # Fibroblast
+Capil <- c("Flt1", "Rgs5")
+markers <- c("EGFP-KASH", "hSNCA-A53T", "mCherry",  "Snca")
+# GliaMark<-c("Aldh1l1", "Aldoc", "Olig2", "Cnp")
+
+# Cell-cell pairings (anchors) to do the integration
+# Method: Reciprocal PCA
+anchors <-
+  FindIntegrationAnchors(
+    SeuObj.singlet.split,
+    reduction = "rpca",
+    dims = 1:obj_dims,
+    anchor.features = c(
+      SeuIntFeatures,
+      LCmark,
+      Neuron,
+      Ex,
+      Inh,
+      Fibro,
+      Astrocytes,
+      Microglia,
+      Oligodendrocyte,
+      OPC,
+      Capil,
+      markers
+    ),
+    scale = F,
+    k.anchor = 10,
+    k.filter = 100,
+    k.score = 20,
+    max.features = 100
+  ) # FindAnchors
+
+
+# Integrate data including in the final matrix some marker genes
+SeuInt <-
+  IntegrateData(
+    anchorset = anchors,
+    dims = 1:obj_dims,
+    k.weight = 20,
+    features.to.integrate = c(
+      SeuIntFeatures,
+      LCmark,
+      Neuron,
+      Ex,
+      Inh,
+      Fibro,
+      Astrocytes,
+      Microglia,
+      Oligodendrocyte,
+      OPC,
+      Capil,
+      markers
+    )
+  )
+rm(anchors, SeuObj.singlet.split)
+```
+
+```{r include = F}
+gc()
+```
+
+```{r HTOmeaning, include = T}
+# #Add meaning to HTO as metadata columns
+# equiv_table <-
+#   data.frame(
+#     hash.ID = unique(SeuInt@meta.data$hash.ID),
+#     Treat = equiv_values_Treat,
+#     Age = equiv_values_Age,
+#     colors = colors_hash
+#     
+#   )
+# print("this is equiv table")
+# equiv_table
+# new_meta_data <-
+#   left_join(select(SeuInt@meta.data, "hash.ID") ,
+#             equiv_table)
+# SeuInt@meta.data$Treat <- new_meta_data$Treat
+# SeuInt@meta.data$Age <- new_meta_data$Age
+print("this is equiv table")
+select(SeuInt@meta.data, "hash.ID", "Treat", "Age") %>% unique()
+```
+
+```{r ASW_batch_Int, include=TRUE}
+SeuInt <- UMAP_maker(SeuInt, dims = 50, k.param = 10)
+SeuInt <- RunTSNE(SeuInt, dims = 1:4, perplexity = 100)
+
+# Obtain the ASW (Average Silhouette Width) batch score (integration quality parameter)
+# ElbowPlot(SeuInt, ndims = 50)
+obj_dims = 30 # Dimensions to use
+d <-
+  stats::dist(Embeddings(SeuInt, reduction = "pca")[, 1:obj_dims], method = "euclidean") # Create Matrix of Euclidean distances between all pair cells
+batches <-
+  tibble(CellNames = dimnames(SeuInt)[[2]],
+         Batch = SeuInt@meta.data$hash.ID) # Set the Batch correspondence to each cell
+batches <- mutate(batches, Batch_int = as.numeric(as.factor(Batch)))
+sil_batch <-
+  cluster::silhouette(x = batches$Batch_int - 1, dist = d) # Calculate SW for batch effect for each cell
+rm(batches, d)
+ASW_batch <-
+  mean(tibble::as_tibble(sil_batch[,])$sil_width) # Calculate the Average Silhoutte 
+```
+
+#### The ASW (Average Silhouette Width) batch score (integration quality parameter) for the integrated data is `r round(ASW_batch, 4)`
+
+```{r, include=TRUE}
+# ElbowPlot(SeuInt, ndims = 50)
+SeuInt_b <- subset(SeuInt, subset = Treat == "Ctrl")
+obj_dims = 30 # Dimensions to use
+d <-
+  stats::dist(Embeddings(SeuInt_b, reduction = "pca")[, 1:obj_dims], method = "euclidean") # Create Matrix of Euclidean distances between all pair cells
+# There are 2 type of reductions to use: "pca" and "umap". "pca" reduction has 50 dimensions while "umap" reduction has 2 dimensions. Since clustering is based on "pca" reductions, we will use "pca" reductions to get the silhoutte score. Despite everthing, UMAP is just a method to vizualize what is hoded on the 50 PCAs. But lets double check in the Seurat Paper and in my presentations if the Clustering use UMAP reduction
+batches <-
+  tibble(CellNames = dimnames(SeuInt_b)[[2]],
+         Batch = SeuInt_b@meta.data$hash.ID) # Set the Batch correspondence to each cell
+batches <- mutate(batches, Batch_int = as.numeric(as.factor(Batch)))
+sil_batch <-
+  cluster::silhouette(x = batches$Batch_int - 1, dist = d) # Calculate SW for batch effect for each cell
+rm(batches, d)
+ASW_batch <-
+  mean(tibble::as_tibble(sil_batch[,])$sil_width) # Calculate the Average Silhoutte 
+```
+
+#### The ASW (Average Silhouette Width) batch score (integration quality parameter) for the non integrated data ONLY on Ctrl samples (different months as "replicates" of clusterization) is `r round(ASW_batch, 4)`
+
+### Find clusters with Louvain's algorithm
+
+See also which clusters have a higher number of intra-sample doublets
+and analyze some quality control measures of each of the clusters.
+
+```{r, include=T}
+SeuInt <-
+  FindNeighbors(SeuInt,
+                dims = 50,
+                k.param = 10,
+                compute.SNN = F)
+SeuInt <-
+  FindClusters(SeuInt,
+               resolution = 0.05,
+               n.start = 100,
+               n.iter = 10)
+```
+
+```{r UMAP-TSNE-QC_Int,  out.width= '150%', out.height= '70%', fig.asp=0.5}
+colors_n <- rainbow(length(unique(SeuInt@meta.data$seurat_clusters)))
+names(colors_n) <- unique(SeuInt@meta.data$seurat_clusters)
+
+UMAP.SeuInt1 <-
+  DimPlot(SeuInt, group.by = "hash.ID", cells =  sample(Cells(SeuInt)), cols = cols_hash)
+UMAP.SeuInt2 <-
+  DimPlot(SeuInt, group.by = "seurat_clusters", cells =  sample(Cells(SeuInt)), label = T, cols =  colors_n)
+(UMAP.SeuInt1 +  UMAP.SeuInt2) &
+  theme(legend.position = "none")
+tSNE.SeuInt1 <-
+  DimPlot(
+    SeuInt,
+    reduction = "tsne",
+    group.by = "hash.ID",
+    cells =  sample(Cells(SeuInt)),
+    cols = cols_hash
+  ) +
+  guides(color = guide_legend(nrow = 4, override.aes = list(size=3)))
+tSNE.SeuInt2 <-
+  DimPlot(
+    SeuInt,
+    reduction = "tsne",
+    group.by = "seurat_clusters",
+    cells =  sample(Cells(SeuInt)), cols = colors_n
+  )
+(tSNE.SeuInt1 +  tSNE.SeuInt2) &
+  theme(legend.position = "bottom", legend.key.size = unit(0.1, "cm"))
+```
+
+```{r}
+Table_no_filter <- table(SeuInt$seurat_clusters, SeuInt$hash.ID)
+Table_no_filter
+```
+
+```{r, out.width= '100%', out.height= '100%'}
+# Plot QC graphics per cluster ####
+QC_plots(SeuInt, "", colors_n)
+```
+
+### Re-do plot:
+
+```{r UMAP-TSNE-QC_Int_singlets, out.width= '100%', out.height= '100%'}
+UMAP.SeuInt1 <-
+  DimPlot(SeuInt, group.by = "hash.ID", cells =  sample(Cells(SeuInt)), cols = cols_hash) + guides(color = guide_legend(override.aes = list(size = 1), ncol = 2))
+UMAP.SeuInt2 <-
+  DimPlot(SeuInt, group.by = "seurat_clusters", cols = colors_n, cells =  sample(Cells(SeuInt)))
+(UMAP.SeuInt1 +  UMAP.SeuInt2) &
+  theme(legend.position = "bottom",
+        legend.key.size = unit(0.1, "cm"))
+# Plot QC graphics per cluster ####
+#QC_plots(SeuInt, "", colors_n)
+```
+
+```{r DataSummary2, include=T}
+# Data summary
+print("data summary integration")
+data_summary <-
+  data.frame(
+    "value" = c(
+      "date" = date,
+      "path" = paste0(wd, FilePath, FileName),
+      "object_name" = "SeuInt",
+      "filtered" = "no",
+      "nr_cells" = dim(SeuInt)[2],
+      "demultiplexed" = "yes",
+      "demux_positive.quantile" = 0.99,
+      "norm.meth" =  "CLR",
+      # Change this if needed
+      HTO_classification,
+      "integrated" = "yes",
+      "ASW_batch" = round(ASW_batch, 4) ,
+      "ASW_dims" = obj_dims,
+      "nr_clusters" = length(levels(SeuInt@meta.data$seurat_clusters))
+    )
+  ) %>% mutate("vars" = rownames(.), .before = value)  %>% `rownames<-`(NULL)
+neigh_params <-
+  SeuInt$FindNeighbors.integrated.pca@params %>% unlist() %>% as.data.frame() %>% `colnames<-`("value")  %>% mutate("vars" = rownames(.), .before = value)  %>% `rownames<-`(NULL) %>% rbind(data.frame("vars" =  "neigh.params", "value" = NA), .)
+clust_params <-
+  SeuInt$FindClusters@params %>% unlist() %>% as.data.frame() %>% `colnames<-`("value")  %>% mutate("vars" = rownames(.), .before = value)  %>% `rownames<-`(NULL) %>% rbind(data.frame("vars" =  "clust.params", "value" = NA), .)
+data_summary <-
+  rbind(data_summary, neigh_params) %>% rbind(clust_params)
+data_summary
+```
+
+### Color the UMAPs by library size:
+
+The plots differ in how the scale is adjusted.
+
+```{r UMAP_lbsz1,  out.width= '100%', out.height= '75%', fig.asp=1.5}
+thfp <-
+  theme(plot.title = element_text(size = 9), legend.text = element_text(size = 4), axis.text = element_text(size = 4), axis.title = element_text(size = 4))
+fp1 <-
+  FeaturePlot(object = SeuInt,
+              features = "UMIs.p.cell",
+              cells =  sample(Cells(SeuInt))) + scale_colour_gradient(low = "lightblue", high = "darkblue") + 
+  labs(title = "All; no lim on lbsz")+ thfp
+
+fp2 <-
+  FeaturePlot(object = SeuInt,
+              features = "UMIs.p.cell",
+              cells =  sample(Cells(SeuInt))) + scale_colour_gradient(
+                limits = c(0, 10000),
+                low = "lightblue",
+                high = "darkblue"
+              ) +  labs(title = "All; scale lim to 10000") + thfp
+
+fp3 <-
+  FeaturePlot(object = SeuInt,
+              features = "UMIs.p.cell",
+              cells =  sample(Cells(SeuInt))) + scale_colour_gradient(
+                limits = c(0, 20000),
+                low = "lightblue",
+                high = "darkblue"
+              ) + labs(title = "All; scale lim to 20000") +thfp
+
+fp4 <-
+  FeaturePlot(
+    object = subset(SeuInt, subset = Treat == "Ctrl"),
+    features = "UMIs.p.cell",
+    cells =  sample(Cells(subset(
+      SeuInt, subset = Treat == "Ctrl"
+    )))
+  ) + scale_colour_gradient(
+    limits = c(0, 20000),
+    low = "lightblue",
+    high = "darkblue"
+  ) + labs(title = "Ctrl; scale lim to 20000") + thfp
+
+fp5 <-
+  FeaturePlot(
+    object = subset(SeuInt, subset = Treat == "PD"),
+    features = "UMIs.p.cell",
+    cells =  sample(Cells(subset(
+      SeuInt, subset = Treat == "PD"
+    )))
+  ) + scale_colour_gradient(
+    limits = c(0, 20000),
+    low = "lightblue",
+    high = "darkblue"
+  ) + labs(title = "PD; scale lim to 20000") + thfp
+
+fp6 <-
+  FeaturePlot(
+    object = subset(SeuInt, subset = Treat == "Ctrl" &
+                      Age == "1mo"),
+    features = "UMIs.p.cell",
+    cells =  sample(Cells(
+      subset(SeuInt, subset = Treat == "Ctrl" &
+               Age == "1mo")
+    ))
+  ) + scale_colour_gradient(
+    limits = c(0, 20000),
+    low = "lightblue",
+    high = "darkblue"
+  ) + labs(title = "Ctrl 1mo; scale lim to 20000") + thfp
+
+fp7 <-
+  FeaturePlot(
+    object = subset(SeuInt, subset = Treat == "Ctrl" &
+                      Age == "2mo"),
+    features = "UMIs.p.cell",
+    cells =  sample(Cells(
+      subset(SeuInt, subset = Treat == "Ctrl" &
+               Age == "2mo")
+    ))
+  ) + scale_colour_gradient(
+    limits = c(0, 20000),
+    low = "lightblue",
+    high = "darkblue"
+  ) + labs(title = "Ctrl 2mo; scale lim to 20000") + thfp
+
+plot_grid(fp1, fp2, fp3, fp4, fp5, fp6, fp7, NULL, ncol = 2)
+```
+
+
+```{r DataSummary3, include=T}
+## Data summary
+print("data summary integrated filtered")
+data_summary <-
+  data.frame(
+    "value" = c(
+      "date" = date,
+      "path" = paste0(wd, FilePath, FileName),
+      "object_name" = "SeuInt",
+      "filtered" = "yes",
+      "UMIs.p.cell_lowthreshold" = UMIs.p.cell_lowthreshold,
+      "UMIs.p.cell_highthreshold" = UMIs.p.cell_highthreshold,
+      "percent.rb_threshold" = percent.rb_threshold,
+      "nr_cells" = dim(SeuInt)[2],
+      "demultiplexed" = "yes",
+      "demux_positive.quantile" = 0.99,
+      "norm.meth" =  "CLR",
+      # Change this if needed
+      HTO_classification,
+      "integrated" = "yes",
+      "ASW_batch" = round(ASW_batch, 4) ,
+      "ASW_dims" = obj_dims,
+      "nr_clusters" = length(levels(SeuInt@meta.data$seurat_clusters))
+    )
+  ) %>% mutate("vars" = rownames(.), .before = value)  %>% `rownames<-`(NULL)
+neigh_params <-
+  SeuInt$FindNeighbors.integrated.pca@params %>% unlist() %>% as.data.frame() %>% `colnames<-`("value")  %>% mutate("vars" = rownames(.), .before = value)  %>% `rownames<-`(NULL) %>% rbind(data.frame("vars" =  "neigh.params", "value" = NA), .)
+clust_params <-
+  SeuInt$FindClusters@params %>% unlist() %>% as.data.frame() %>% `colnames<-`("value")  %>% mutate("vars" = rownames(.), .before = value)  %>% `rownames<-`(NULL) %>% rbind(data.frame("vars" =  "clust.params", "value" = NA), .)
+data_summary <-
+  rbind(data_summary, neigh_params) %>% rbind(clust_params)
+data_summary
+```
+
+```{r EGFP_hSNCA, include = T}
+#Annotate which cell express KASH-EGFP, hSNCA-A53T and mCherry
+print("get info of EGFP, hSNCA and mCherry positive cells")
+DefaultAssay(SeuInt) <- "RNA"
+SeuInt@meta.data$EGFP <-
+  ifelse(GetAssayData(SeuInt, slot = "counts")["EGFP-KASH", ] > 0, 1, 0) %>% as.factor()
+SeuInt@meta.data$hSNCA <-
+  ifelse(GetAssayData(SeuInt, slot = "counts")["hSNCA-A53T", ] > 0, 1, 0) %>% as.factor()
+```
+
+### Neuronal markers:
+
+-   Slc6a2 = Noradrenaline Transporter (NET)
+
+-   Th = Catalize L-DOPA production (precursor of Dopamine)
+
+-   Dbh = Catalize Noradrenaline production from Dopamine
+
+-   lightblue = GABAergic
+
+-   lightgreen = Glutamatergic
+
+-   brown = Cholinergic
+
+-   violet = DopamineTransporter
+
+-   red = AmineTranporter
+
+-   darkbrown = Serotoninergic
+
+-   orange = AmineDegradetion
+
+```{r NeuronalMarkers,  out.width= '150%', out.height= '50%', fig.asp=1.2}
+Nordenergic <- c("Th", "Dbh") #"Th": Dopamine synthesis enzyme
+NoradrenalineTransporter <- "Slc6a2"
+GABAergic <-
+  c("Gad1", "Gad2") #"Gad1", "Gad2" : GABA synthesis enzymes
+Glutamatergic <-
+  c("Slc17a7", "Slc17a6", "Slc17a8") #"Slc17a7", "Slc17a6", "Slc17a8": Glutamate transporters
+Cholinergic <-
+  c("Slc18a3", "Slc5a7") #"Slc18a3", "Slc5a7": Acetylcholine transporters "Gm5741"?
+DopamineTransporter <- "Slc6a3" #"Slc6a3": Dopamine Transporter
+AmineTranporter <-
+  c("Slc18a2", "Vat1") #"Slc18a2": Monoamine transporter (dopamine, norepinephrine, serotonin, and histamine) #"Vat1": Vesicle amine transporter
+Serotoninergic <-
+  c("Tph1", "Htr1a", "Htr1b", "Htr1f", "Htr1d",  "Htr2c") #"Tph1": Serotonin synthesis enzyme  #"Htr1a", "Htr1b", "Htr1f", "Htr1d",  "Htr2c": Serotonin transporter
+AmineDegradetion <-
+  c("Comt", "Maoa", "Maob") #"Comt", "Maoa", "Maob": Amine degradetion
+
+# Plot neuronal markers
+DefaultAssay(SeuInt) <-
+  "RNA" # Th gene is not a variable feature in the INTE assay
+th <-
+  theme(
+    text = element_text(size = 8),
+    axis.text = element_text(size = 5),
+    plot.title = element_text(size = 10, face = "bold")
+  )
+plot1 <-
+  FeaturePlot(
+    SeuInt,
+    features = c(Nordenergic, NoradrenalineTransporter, "EGFP-KASH"),
+    pt.size = 0.00001,
+    order =  T,
+    ncol = length(c(Nordenergic, NoradrenalineTransporter, "EGFP-KASH"))
+  ) & th #normalized counts
+SeuInt@meta.data$Thg <-
+  ifelse(GetAssayData(SeuInt, slot = "counts")["Th", ] > 0, 1, 0) %>% as.factor()
+SeuInt@meta.data$Dbhg <-
+  ifelse(GetAssayData(SeuInt, slot = "counts")["Dbh", ] > 0, 1, 0) %>% as.factor()
+SeuInt@meta.data$Slc6a2g <-
+  ifelse(GetAssayData(SeuInt, slot = "counts")["Slc6a2", ] > 0, 1, 0) %>% as.factor()
+plot2 <- DimPlot(SeuInt, group.by = "Thg", order = T) + th
+plot3 <- DimPlot(SeuInt, group.by = "Dbhg", order = T) + th
+plot4 <- DimPlot(SeuInt, group.by = "Slc6a2g", order = T) + th
+layout1 <- "
+ABC
+DFG
+HIJ
+KLM
+"
+plot5 <-
+  FeaturePlotMultiple2(
+    SeuInt,
+    feature = c(
+      GABAergic,
+      Glutamatergic,
+      Cholinergic,
+      DopamineTransporter,
+      AmineTranporter
+    ),
+    color = rep(
+      c("deepskyblue3", "limegreen", "chocolate2", "violetred2", "red"),
+      times = c(2, 3, 2, 1, 2)
+    ),
+    ord = T,
+    alf = 0.5,
+    minlim = "q1"
+  )
+plot5 <-
+  wrap_plots(plot5, guides = "keep", design = layout1) # Slc18a3, Slc17a7, Slc17a8 very low expression
+plot6 <-
+  FeaturePlotMultiple2(
+    SeuInt,
+    feature = c(Serotoninergic, AmineDegradetion),
+    color = rep(c("#6e2c00", "darkorange"), times = c(6, 3)),
+    ord = T,
+    alf = 0.5,
+    minlim = "q1"
+  )
+plot6 <-
+  wrap_plots(plot6, guides = "keep", design = layout1) # Tph1, Maob very low expression
+palfa <- plot_grid(plot1 , plot_grid(plot2, plot3, plot4, NULL, nrow = 1), ncol = 1)
+pbeta <- plot_grid(plot5, plot_grid(plot6, NULL, ncol = 1, rel_heights = c(8, 1)), nrow = 1)
+plot_grid(palfa, pbeta, ncol = 1, rel_heights = c(0.5, 1)) 
+```
+
+## The normalized expression of transgenes markers
+
+The enrichment was calculated without taking into account the replicates, with fisher exact test. The odds ratio of the `fisher.test()` is estimated by an MLE, based on a Non Centered Hypergeometric distribution supported on the observed marginal probabilities and the p-value is obtained by getting the probability in which a number related to the first element of the matrix is located in a shifted distribution to be "centered" in an OR of 1. For more info try to intepret the source code or its documentation references [here](https://github.com/SurajGupta/r-source/blob/master/src/library/stats/R/fisher.test.R)
+
+```{r TransgeneExpression}
+# Plot the UMAP colored by EGFP and hSNCA expressión and add a UMAP of clusters by the side and the enrichment of EGFP+hSNCA+ cells on PD Treatment
+# Plot UMAP colored by EGFP+ OR EGFP- - continuous scale
+SeuInt@meta.data$Genes <- ifelse(SeuInt@meta.data$EGFP=="1"&SeuInt@meta.data$hSNCA =="1", "both",
+                                    ifelse(SeuInt@meta.data$EGFP=="0"&SeuInt@meta.data$hSNCA =="0", "none",
+                                           ifelse(SeuInt@meta.data$EGFP == "1", "KASH-EGFP", "hSNCA-A53T"))) %>% factor(levels = c("none", "KASH-EGFP", "hSNCA-A53T", "both"))
+
+
+# text <-
+#   ggplot(data.frame(x = 1, y = 1)) + geom_text(
+#     size = 3,
+#     label = paste0("EGFP+SNCA+ enrichment: ", paste(label2analyze_EGFP_hSNCA_FisherTest, collapse = "")),
+#     x = 0,
+#     y = 0,
+#     hjust = 0) + theme_void()
+SeuInt_PD <- subset(SeuInt, subset = Treat == "PD")
+
+text <- ""
+DefaultAssay(SeuInt_PD) <- "integrated"
+UMAP_grid <- UMAPs_for_grid(SeuInt_PD, "Clusters")
+UMAP_PD <- plot_grid(plot_grid(UMAP_grid[["UMAP4_split"]], UMAP_grid[["UMAPa_edit"]], ncol = 2), plot_grid(NULL, UMAP_grid[["UMAP4_legend"]], ncol = 2, rel_widths = c(0.1, 3)), text, ncol = 1, nrow = 3, rel_heights = c(4,0.2,0.7))
+UMAP_PD
+```
+
+#### Fisher exact test
+
+First try with the fisher exact test, pooling all cells of each treatment together (no condition DS stratification). Part of the interpretation of the odds ratio can be found [here](https://stats.stackexchange.com/questions/211487/interpretation-of-the-fisher-exact-test) and a short discussion about its p-value can be found  [here](https://www.scalestatistics.com/fishers-exact-test.html)
+```{r}
+# Calculate the global- or cluster-specific- contingency table of the expression of hSNCA and EGFP
+
+# Obtain the global contingency
+global_contingency <- select(SeuInt_PD@meta.data, "seurat_clusters", "hSNCA", "EGFP") %>% do(data.frame(      
+    EGFP_SNCA = EGFP_SNCA(.),
+      EGFP = EGFP(.),
+      SNCA = SNCA(.),
+      Neith = Neith(.)
+    ))
+
+# Obtain the cluster contingency
+cluster_contingency <- select(SeuInt_PD@meta.data, "seurat_clusters", "hSNCA", "EGFP") %>% group_by(seurat_clusters) %>%
+  do(data.frame(      
+    EGFP_SNCA = EGFP_SNCA(.),
+      EGFP = EGFP(.),
+      SNCA = SNCA(.),
+      Neith = Neith(.)
+    ))
+
+# Obtain the "rest of cells" contingency for each cluster
+rest_contingency <- apply(
+  as.matrix(cluster_contingency[,-1]), #Take the values of EGFP and hSNCA presence per cluster
+  1, 
+  function(x) -1*x + as.vector(global_contingency[1,])) %>% #And get the global EGFP and hSNCA presence minus the presence in each of the clusters
+  do.call(what = rbind) %>% as.data.frame()
+rest_contingency$seurat_clusters <- cluster_contingency$seurat_clusters
+
+# Obtain the contingency table for the presence/absence of hSNCA (alone or together with EGFP)
+# for the cells of each cluster and the rest of the cells of the data set
+
+hSNCA_contingency <- data.frame(
+  yes_cluster = cluster_contingency$SNCA + cluster_contingency$EGFP_SNCA,
+  no_cluster = cluster_contingency$EGFP + cluster_contingency$Neith,
+  yes_rest_cluster = rest_contingency$SNCA + rest_contingency$EGFP_SNCA,
+  no_rest_cluster = rest_contingency$EGFP + rest_contingency$Neith
+  )
+
+# Obtain the contingency table for the presence/absence of hSNCA with EGFP
+# for the cells of each cluster and the rest of the cells of the data set
+
+EGFP_hSNCA_contingency <- data.frame(
+  yes_cluster = cluster_contingency$EGFP_SNCA,
+  no_cluster = cluster_contingency$EGFP + cluster_contingency$Neith +
+    cluster_contingency$SNCA,
+  yes_rest_cluster = rest_contingency$EGFP_SNCA,
+  no_rest_cluster = rest_contingency$EGFP + rest_contingency$Neith +
+    rest_contingency$SNCA
+  )
+
+# Calculate the enrichment of hSNCA for each cluster compared to rest of cells
+hSNCA_FisherTest<-apply(as.matrix(hSNCA_contingency), 1, fisher)
+colnames(hSNCA_FisherTest) <- rest_contingency$seurat_clusters
+hSNCA_FisherTest<- rbind(hSNCA_FisherTest, "FDR" = p.adjust(hSNCA_FisherTest["p_val",], "BH"))
+
+# Calculate the enrichment of hSNCA with EGFP for each cluster compared to rest of cells
+EGFP_hSNCA_FisherTest<-apply(as.matrix(EGFP_hSNCA_contingency), 1, fisher)
+colnames(EGFP_hSNCA_FisherTest) <- rest_contingency$seurat_clusters
+EGFP_hSNCA_FisherTest<- rbind(EGFP_hSNCA_FisherTest, "FDR" = p.adjust(EGFP_hSNCA_FisherTest["p_val",], "BH"))
+
+# Calculate the enrichment of hSNCA with EGFP but instead of taking as control the rest of the cells as it is, I will "shuffle" the tags for EGFP and SNCA, so that the ocurrence of both genes will be drived randomly (is a way to see if the cluster itself has enriched the co-mark of hSNCA and EGFP, unbiased big cluster enrichment on it).
+
+# Obtain parameters for shuffled dataset
+shuffled_rest_param <- data.frame(EGFP = rest_contingency$EGFP_SNCA + rest_contingency$EGFP, SNCA = rest_contingency$EGFP_SNCA + rest_contingency$SNCA, Neith = rest_contingency$Neith) %>% mutate(Total = EGFP + SNCA + Neith, Prop_EGFP = EGFP/Total, Prop_SNCA = SNCA/Total, Prop_Neith = Neith/Total)
+list_shuffled_rest_param <- split(shuffled_rest_param[4:7],seq(nrow(shuffled_rest_param[4:7])))   
+  
+# Create random numbers of EGFP, SNCA, both and Neith based on parameters
+shuffled_rest_contingency <- lapply(list_shuffled_rest_param, function(x) create_random(x[, "Total"], x[, "Prop_EGFP"], x[, "Prop_SNCA"], x[, "Prop_Neith"])) %>% do.call(what = rbind) %>% as.data.frame()
+
+# Make contingency table
+shuff_EGFP_hSNCA_contingency <- data.frame(
+  yes_cluster = cluster_contingency$EGFP_SNCA,
+  no_cluster = cluster_contingency$EGFP + cluster_contingency$Neith +
+    cluster_contingency$SNCA,
+  yes_rest_cluster = shuffled_rest_contingency$EGFP_SNCA,
+  no_rest_cluster = shuffled_rest_contingency$EGFP + shuffled_rest_contingency$Neith +
+    shuffled_rest_contingency$SNCA
+  )
+
+# Calculate the enrichment of hSNCA with EGFP for each cluster compared to random cells
+shuff_EGFP_hSNCA_FisherTest<-apply(as.matrix(shuff_EGFP_hSNCA_contingency), 1, fisher)
+colnames(shuff_EGFP_hSNCA_FisherTest) <- rest_contingency$seurat_clusters
+shuff_EGFP_hSNCA_FisherTest<- rbind(shuff_EGFP_hSNCA_FisherTest, "FDR" = p.adjust(shuff_EGFP_hSNCA_FisherTest["p_val",], "BH"))
+## Pero esta bien hacer esto una sola vez? Lo deberia repetir. No serian datos imputados. Si lo repito como combino los odds.ratios y los p-values.
+
+# Obtain the contingency just for the combination of both variables for each cluster. Not very informative for our aims since we already jnow that, depite the results, all SNCA+ cells have been sorted, so theyr epress EGFP at some point (despite the detectable expression).
+contingency <- select(SeuInt_PD@meta.data, "seurat_clusters", "hSNCA", "EGFP") %>% group_by(seurat_clusters) %>%
+  do(data.frame(      
+    EGFP_SNCA = EGFP_SNCA(.),
+      EGFP = EGFP(.),
+      SNCA = SNCA(.),
+      Neith = Neith(.)
+    ))
+FisherTest<-apply(as.matrix(contingency[, -1]), 1, fisher)
+colnames(FisherTest) <- contingency$seurat_clusters
+FisherTest<- rbind(FisherTest, "FDR" = p.adjust(FisherTest["p_val",], "BH"))
+
+# Add a text for the enrichment
+label2analyze_FisherTest <- label2analyze(FisherTest)
+label2analyze_shuff_EGFP_hSNCA_FisherTest<- label2analyze(shuff_EGFP_hSNCA_FisherTest)
+label2analyze_EGFP_hSNCA_FisherTest <- label2analyze(EGFP_hSNCA_FisherTest)
+label2analyze_hSNCA_FisherTest <- label2analyze(hSNCA_FisherTest)
+```
+
+The enrichment are:
+
+EGFP+SNCA+ enrichment: 
+
+```{r}
+label2analyze_EGFP_hSNCA_FisherTest
+```
+
+shuffled EGFP+SNCA+ enrichment:
+```{r}
+label2analyze_shuff_EGFP_hSNCA_FisherTest
+```
+
+SNCA+ enrichment:
+```{r}
+label2analyze_hSNCA_FisherTest
+```
+
+
+```{r}
+# SeuInt@meta.data$Genes <-
+#   ifelse(
+#     SeuInt@meta.data$EGFP == "1" & SeuInt@meta.data$hSNCA == "1",
+#     "both",
+#     ifelse(
+#       SeuInt@meta.data$EGFP == "0" & SeuInt@meta.data$hSNCA == "0",
+#       "none",
+#       ifelse(SeuInt@meta.data$EGFP == "1", "KASH-EGFP", "hSNCA-A53T")
+#     )
+#   ) %>% factor(levels = c("none", "KASH-EGFP", "hSNCA-A53T", "both"))
+# SeuInt_PD <- subset(SeuInt, subset = Treat == "PD")
+# 
+# # Add a text with the EGFP+hSNCA+ cells in PD dataset
+# contingency <-
+#   select(SeuInt_PD@meta.data, "seurat_clusters", "hSNCA", "EGFP") %>% group_by(seurat_clusters) %>%
+#   do(data.frame(
+#     Neith = Neith(.),
+#     SNCA = SNCA(.),
+#     EGFP = EGFP(.),
+#     EGFP_SNCA = EGFP_SNCA(.)
+#   ))
+# FisherTest <- apply(as.matrix(contingency[, -1]), 1, fisher)
+# colnames(FisherTest) <- contingency$seurat_clusters
+# FisherTest <-
+#   rbind(FisherTest, "FDR" = p.adjust(FisherTest["p_val",], "BH"))
+# label2analyze <- c()
+#   for (i in 1:length(clusters2analyze)){
+#     if (i != 4){
+#       label2analyze[i] <- paste0("Cluster ", clusters2analyze[i], " : ", round(FisherTest["enrich", clusters2analyze[i]], 2), " (p-adj:", format(FisherTest["FDR", clusters2analyze[i]], digits=3), ") ; ")
+#     } else {
+#       label2analyze[i] <- paste0("Cluster ", clusters2analyze[i], " : ", round(FisherTest["enrich", clusters2analyze[i]], 2), " (p-adj:", format(FisherTest["FDR", clusters2analyze[i]], digits=3), ") ;\n")
+#     }
+#   }
+# text <-
+#   ggplot(data.frame(x = 1, y = 1)) + geom_text(
+#     size = 3,
+#     label = paste0("EGFP+SNCA+ enrichment: ", paste(label2analyze, collapse = "")),
+#     x = 0,
+#     y = 0.5,
+#     hjust = 0) + theme_void()
+# DefaultAssay(SeuInt_PD) <- "integrated"
+# UMAP_grid <- UMAPs_for_grid(SeuInt_PD, "Clusters")
+# UMAP_PD <-
+#   plot_grid(
+#     plot_grid(UMAP_grid[["UMAP4_split"]], UMAP_grid[["UMAPa_edit"]], ncol = 2),
+#     plot_grid(
+#       NULL,
+#       UMAP_grid[["UMAP4_legend"]],
+#       ncol = 2,
+#       rel_widths = c(0.1, 3)
+#     ),
+#     text,
+#     ncol = 1,
+#     nrow = 3,
+#     rel_heights = c(4, 0.2, 0.5)
+#   )
+# UMAP_PD
+```
+
+```{r, include=T}
+rm(SeuInt_PD); gc()
+```
+
+#### Analyze for each month:
+
+### UMAP with \# of cells per cluster:
+
+```{r Nr.cells.month, out.width= '100%'}
+#### For each month ####
+SeuInt_sub <- list()
+ncells <- list()
+for (i in c("1mo", "2mo")) {
+  SeuInt_sub[[i]] <- subset(SeuInt, subset = Age == i)
+  ## Nr. cells per cluster ####
+  # Generate Labels of clusters and calculate number of cells of each cluster
+  # Number of PD cells in whole dataset and on each cluster
+  ncellsPD <-
+    select(SeuInt_sub[[i]]@meta.data, "seurat_clusters", "Treat") %>% group_by(seurat_clusters, Treat) %>%
+    summarize(n.cells = n()) %>% filter(Treat == "PD")
+  tot.PD <- sum(ncellsPD$n.cells)
+  # Number of Ctrl cells in whole dataset and on each cluster
+  ncellsCtrl <-
+    select(SeuInt_sub[[i]]@meta.data, "seurat_clusters", "Treat") %>% group_by(seurat_clusters, Treat) %>%
+    summarize(n.cells = n()) %>% filter(Treat == "Ctrl")
+  tot.Ctrl <- sum(ncellsCtrl$n.cells)
+  # DataFrame with: dif.prop = Difference of PD and Ctrl percentage on each cluster; diff.abs = diff.prop but in absolute value;
+  # PD.text = label of number of PD cells on each cluster; Ctrl.text = label of number of Ctrl cells on each cluster
+  ncells_i <-
+    left_join(ncellsPD, ncellsCtrl, by = "seurat_clusters") %>% mutate(
+      dif.prop = round(100 * (n.cells.x - n.cells.y) / n.cells.y, 0),
+      dif.abs = paste0(seurat_clusters, " (", n.cells.x, ":", n.cells.y, ")"),
+      `PD.text` = paste0(seurat_clusters, " (", n.cells.x, ")"),
+      `Ctrl.text` = paste0(seurat_clusters, " (", n.cells.y, ")")
+    ) %>% select(seurat_clusters, dif.prop, dif.abs, `PD.text`, `Ctrl.text`)
+  
+  # Total cells on each cluster
+  totcells <-
+    select(SeuInt_sub[[i]]@meta.data, "seurat_clusters", "Treat") %>% group_by(seurat_clusters) %>%
+    summarize(tot.cells = n())
+  # DataFrame with previous info plus: brak.text = label of total cells and dif.prop; Int.text = label of percentage of cells from whole dataset
+  ncells[[i]] <-
+    left_join(ncells_i, totcells) %>% mutate(
+      brak.text = paste0(seurat_clusters, " (", tot.cells, ": ", dif.prop, " %)"),
+      Int.text = paste0(seurat_clusters, " (", round(100 *
+                                                       tot.cells / dim(SeuInt_sub[[i]])[2], 4), "%)")
+    )
+  
+  ## Plot UMAP of integrated data ####
+  # Plot by clusters with #Cells: PD % Dif and by Treatment
+  ClusterLabels <-  ncells[[i]]$brak.text
+  ClusterBreaks <- ncells[[i]]$seurat_clusters
+  title_text <-
+    paste0(
+      i,
+      " > ",
+      UMIs.p.cell_lowthreshold,
+      " <",
+      UMIs.p.cell_highthreshold,
+      " UMI < ",
+      percent.rb_threshold,
+      " per.rb Matrix (",
+      dim(SeuInt_sub[[i]])[2],
+      " Cells)"
+    )
+  subtitle_text <- "r=0.1; k=10; dim=50; Louvain"
+  color_a <- "Clusters (#Cells: PD % Dif)"
+  color_b <- "Treatment"
+  
+  UMAP1 <-
+    UMAP_by_clust(
+      SeuInt_sub[[i]],
+      ClusterBreaks,
+      ClusterLabels,
+      0.5,
+      title_text,
+      subtitle_text,
+      color_a,
+      color_b,
+      do_label = F,
+      n_color = colors_n
+    ) #Ojo que hay un aparte del titulo que se superpone con otra
+  UMAP1a <- UMAP1[["UMAPa"]] + UMAP1[["UMAPb"]]
+  print(UMAP1a)
+}
+
+for (i in c("1mo", "2mo")) {
+  ## Plot UMAP of integrated data ####
+  # Plot by clusters with #Cells: PD % Dif and by Treatment
+  ClusterLabels <-  ncells[[i]]$brak.text
+  ClusterBreaks <- ncells[[i]]$seurat_clusters
+  title_text <-
+    paste0(
+      i,
+      " > ",
+      UMIs.p.cell_lowthreshold,
+      " <",
+      UMIs.p.cell_highthreshold,
+      " UMI < ",
+      percent.rb_threshold,
+      " per.rb Matrix (",
+      dim(SeuInt_sub[[i]])[2],
+      " Cells)"
+    )
+  subtitle_text <- "r=0.1; k=10; dim=50; Louvain"
+  color_a <- "Clusters (#Cells: PD % Dif)"
+  color_b <- "Treatment"
+  
+  UMAP1 <-
+    UMAP_by_clust(
+      SeuInt_sub[[i]],
+      ClusterBreaks,
+      ClusterLabels,
+      0.5,
+      title_text,
+      subtitle_text,
+      color_a,
+      color_b,
+      do_label = F,
+      n_color = colors_n
+    ) #Ojo que hay un aparte del titulo que se superpone con otra
+  # Plot by clusters with #Cells: PD % Dif and by Treatment
+  UMAP1b <-
+    (
+      LabelClusters(
+        UMAP1[["UMAPa"]],
+        id = "ident",
+        size = 4,
+        repel = F
+      ) + theme(legend.position = "none")
+    ) +  UMAP1[["UMAPb"]]
+  #print(UMAP1b)
+}
+```
+
+### UMAP by clusters with #Cells PD:Ctrl, splitted by treatment:
+
+```{r PD:Ctrl,  out.width= '85%', out.height= '25%', fig.asp=0.5}
+for (i in c("1mo", "2mo")) {
+  ClusterLabels <-  ncells[[i]]$dif.abs
+  ClusterBreaks <- ncells[[i]]$seurat_clusters
+  UMAP2 <-
+    DimPlot(
+      SeuInt_sub[[i]],
+      reduction = "umap",
+      label = T,
+      pt.size = 0.5,
+      split.by = "Treat",
+      cols = colors_n
+    ) +
+scale_colour_manual(values = colors_n, breaks = ClusterBreaks, labels = ClusterLabels) +
+    labs(
+      title = paste0(
+        i,
+        " > ",
+        UMIs.p.cell_lowthreshold,
+        " <",
+        UMIs.p.cell_highthreshold,
+        " UMI < ",
+        percent.rb_threshold,
+        " per.rb Matrix (",
+        dim(SeuInt_sub[[i]])[2],
+        " Cells)"
+      ),
+      subtitle = "r=0.1; k=10; dim=50; Louvain",
+      color = "Clusters (#Cells PD:Ctrl)"
+    ) +
+    theme_classic(base_size = 10) +
+    theme(legend.text = element_text(size = 6)) +
+    guides(color = guide_legend(override.aes = list(size = 1), ncol = 2))
+  print(UMAP2)
+}
+```
+
+### QC graphics:
+
+```{r QC,  out.width= '100%'}
+for (i in c("1mo", "2mo")) {
+  DefaultAssay(SeuInt_sub[[i]]) <- "RNA"
+  QC_plot_Int <- QC_plots(SeuInt_sub[[i]], i, colors_n)
+  print(QC_plot_Int)
+}
+```
+
+```{r KASH-EGFP+, include=T, out.width= '50%', out.height= '50%'}
+clusters_EGFP <- list()
+for (i in c("1mo", "2mo")) {
+  clusters_EGFP_tot <-
+    select(SeuInt_sub[[i]]@meta.data, "seurat_clusters", "EGFP", "Treat") %>% group_by(seurat_clusters, Treat) %>%
+    summarize(
+      sum.EGFP = sum(grepl(1, EGFP)),
+      tot = n(),
+      per.EGFP.treat = 100 * (sum.EGFP / tot)
+    ) %>% ungroup()
+  # DataFrame with previous info, adding:
+  # perc = percentage of EGFP+ cells from all EGFP+ cells in that treatment
+  # perc_text = the text of percentage of EGFP+ cells for cluster 0 and 4.
+  clusters_EGFP_tot <-
+    group_by(clusters_EGFP_tot, Treat) %>% summarize(tot.EGFP.orig = sum(sum.EGFP)) %>% ungroup() %>%
+    left_join(clusters_EGFP_tot) %>%
+    mutate(
+      perc = sum.EGFP / tot.EGFP.orig,
+      perc_text = ifelse(
+        seurat_clusters %in% text4stackbarEGFP,
+        paste0(round(100 * sum.EGFP / tot.EGFP.orig, 2), "%"),
+        ""
+      )
+    )
+  # per.EGFP.tot: percentage of EGFP+ cells from total cells without considering the treatment
+  clusters_EGFP[[i]] <-
+    group_by(clusters_EGFP_tot, seurat_clusters) %>% summarize(
+      tot.orig = sum(tot),
+      per.EGFP.tot = 100 * sum(sum.EGFP) / tot.orig,
+      no.EGFP = ifelse(sum(sum.EGFP) == 0, T, F)
+    ) %>% ungroup %>% left_join(clusters_EGFP_tot)
+  # Plot the perc as a stacked ber. Each bar is a treatment and clusters for each treatment are stacked.
+}
+# Observations:
+# How to get the clusters that belong to the NA neurons of the LC?
+# - By the percentage of EGFP on the control treatment?
+#   - How to determine the threshold of the percentage to assign that cluster to a NA-LC cluster?
+#   - Do I have to filter out clusters that have too few cells depite having a high EGFP percentage. How much is few?
+#   - Do I have to consider an EGFP cluster when the I have a high percentage only for the PD treatment but not for the Ctrl?
+#   - Can I do all this with a assuming a Bernoulli probability? Does this make sense depite samples are not independent?
+# - By enrichment of LC genes by a GSVA analysis?
+# - By another classification algorithm for single cells?
+```
+
+### Number and percentage of KASH-EGFP+ cells:
+
+```{r,  out.width= '50%', out.height= '50%'}
+for (i in c("1mo", "2mo")) {
+  Stacked_bar <-
+    ggplot(clusters_EGFP[[i]],
+           aes(fill = seurat_clusters, x = Treat, y = perc)) + #aes(fill=seurat_clusters, y=perc, x=Treat)
+    geom_bar(position = "stack",
+             stat = "identity",
+             color = "white") + #position="fill"
+    # scale_fill_manual(values = colors_n) +
+    geom_text(aes(label = perc_text),
+              position = position_stack(vjust = 0.5),
+              size = 5) +
+    labs(
+      title = i,
+      fill = "Clusters",
+      y = "Number of EGFP cells",
+      x = "Treatment"
+    ) +
+    my_theme +
+    scale_fill_manual(values = colors_n, breaks = filter(clusters_EGFP[[i]], no.EGFP == F)$seurat_clusters) +
+    scale_y_continuous(breaks = seq(0, 300, by = 10), labels = insert_minor(seq(0, 300, by =
+                                                                                  50), 4)) +
+    geom_area(
+      aes(x = c("PD" = 1.55, "Ctrl" = 1.45)[Treat]),
+      position = "stack",
+      colour = "white",
+      alpha = 0.5,
+      #position="fill"
+      outline.type = "both"
+    )
+  print(Stacked_bar)
+  ## Horizontal stacked bar of number and percentage of EGFP+ cells
+  # Stacked_bar_horiz <- Stacked_bar + coord_flip()
+  # print(Stacked_bar_horiz)
+}
+```
+
+### Number and percentage of KASH-EGFP+ cells:
+
+```{r barKASH-EGFP+,  out.width= '50%', out.height= '50%'}
+for (i in c("1mo", "2mo")) {
+  Stacked_bar <-
+    ggplot(clusters_EGFP[[i]],
+           aes(fill = seurat_clusters, x = Treat, y = sum.EGFP)) + #aes(fill=seurat_clusters, y=perc, x=Treat)
+    geom_bar(position = "stack",
+             stat = "identity",
+             color = "white") + #position="fill"
+    geom_text(aes(label = perc_text),
+              position = position_stack(vjust = 0.5),
+              size = 5) +
+    labs(
+      title = i,
+      fill = "Clusters",
+      y = "Number of EGFP cells",
+      x = "Treatment"
+    ) +
+    my_theme +
+    scale_fill_manual(values = colors_n, breaks = filter(clusters_EGFP[[i]], no.EGFP == F)$seurat_clusters) +
+    scale_y_continuous(breaks = seq(0, 300, by = 10), labels = insert_minor(seq(0, 300, by =
+                                                                                  50), 4)) +
+    geom_area(
+      aes(x = c("PD" = 1.55, "Ctrl" = 1.45)[Treat]),
+      position = "stack",
+      colour = "white",
+      alpha = 0.5,
+      #position="fill"
+      outline.type = "both"
+    )
+  print(Stacked_bar)
+  ## Horizontal stacked bar of number and percentage of EGFP+ cells
+  # Stacked_bar_horiz <- Stacked_bar + coord_flip()
+  # print(Stacked_bar_horiz)
+}
+```
+
+### Number and percentage of cells of all cells (not only KASH-EGFP+):
+
+```{r,  out.width= '50%', out.height= '50%'}
+clusters_EGFP <- list()
+for (i in c("1mo", "2mo")) {
+  clusters_EGFP[[i]] <-
+    select(SeuInt_sub[[i]]@meta.data, "seurat_clusters", "Treat") %>% group_by(seurat_clusters, Treat) %>%
+    summarize(tot = n()) %>% ungroup()
+  # # Plot the perc as a stacked ber. Each bar is a treatment and clusters for each treatment are stacked.
+  clusters_EGFP[[i]] <-
+    group_by(clusters_EGFP[[i]], Treat) %>% summarize(TotTreat = sum(tot)) %>% ungroup %>% left_join(clusters_EGFP[[i]]) %>%
+    mutate(
+      percTot = tot / TotTreat,
+      Int.text =  ifelse(
+        seurat_clusters %in% text4stackbar,
+        paste0(round(100 * percTot, 2), " %"),
+        " "
+      )
+    )
+  
+  Stacked_bar <-
+    ggplot(clusters_EGFP[[i]], aes(fill = seurat_clusters, x = Treat, y = percTot)) + #aes(fill=seurat_clusters, y=perc, x=Treat)
+    geom_bar(position = "stack",
+             stat = "identity",
+             color = "white") + #position="fill"
+    scale_fill_manual(values = colors_n) +
+    geom_text(aes(label = Int.text),
+              position = position_stack(vjust = 0.5),
+              size = 5) +
+    labs(
+      title = i,
+      fill = "Clusters",
+      y = "Number of cells",
+      x = "Treatment"
+    ) +
+    my_theme +
+    #scale_fill_discrete(values = colors_n, breaks= filter(clusters_EGFP_tot, no.EGFP==F)$seurat_clusters) +
+    scale_y_continuous(breaks = seq(0, 3000, by = 20),
+                       labels = insert_minor(seq(0, 3000, by = 100), 4)) +
+    geom_area(
+      aes(x = c("PD" = 1.55, "Ctrl" = 1.45)[Treat]),
+      position = "stack",
+      colour = "white",
+      alpha = 0.5,
+      #position="fill"
+      outline.type = "both"
+    )
+  print(Stacked_bar)
+}
+```
+
+### Number and percentage of cells of all cells (not only KASH-EGFP+):
+
+```{r barAll,  out.width= '50%', out.height= '50%'}
+clusters_EGFP <- list()
+for (i in c("1mo", "2mo")) {
+  clusters_EGFP[[i]] <-
+    select(SeuInt_sub[[i]]@meta.data, "seurat_clusters", "Treat") %>% group_by(seurat_clusters, Treat) %>%
+    summarize(tot = n()) %>% ungroup()
+  # # Plot the perc as a stacked ber. Each bar is a treatment and clusters for each treatment are stacked.
+  clusters_EGFP[[i]] <-
+    group_by(clusters_EGFP[[i]], Treat) %>% summarize(TotTreat = sum(tot)) %>% ungroup %>% left_join(clusters_EGFP[[i]]) %>%
+    mutate(
+      percTot = tot / TotTreat,
+      Int.text =  ifelse(
+        seurat_clusters %in% text4stackbar,
+        paste0(round(100 * percTot, 2), " %"),
+        " "
+      )
+    )
+  
+  Stacked_bar <-
+    ggplot(clusters_EGFP[[i]], aes(fill = seurat_clusters, x = Treat, y = tot)) + #aes(fill=seurat_clusters, y=perc, x=Treat)
+    geom_bar(position = "stack",
+             stat = "identity",
+             color = "white") + #position="fill"
+    scale_fill_manual(values = colors_n) +
+    geom_text(aes(label = Int.text),
+              position = position_stack(vjust = 0.5),
+              size = 5) +
+    labs(
+      title = i,
+      fill = "Clusters",
+      y = "Number of cells",
+      x = "Treatment"
+    ) +
+    my_theme +
+    #scale_fill_discrete(values = colors_n, breaks= filter(clusters_EGFP_tot, no.EGFP==F)$seurat_clusters) +
+    scale_y_continuous(breaks = seq(0, 3000, by = 20),
+                       labels = insert_minor(seq(0, 3000, by = 100), 4)) +
+    geom_area(
+      aes(x = c("PD" = 1.55, "Ctrl" = 1.45)[Treat]),
+      position = "stack",
+      colour = "white",
+      alpha = 0.5,
+      #position="fill"
+      outline.type = "both"
+    )
+  print(Stacked_bar)
+}
+```
+
+### Violin plots of expression of "EGFP-KASH" per treatment
+
+```{r Vln.month,  out.width= '50%', out.height= '50%', fig.asp=0.75}
+for (i in c("1mo", "2mo")) {
+  VlnPlot1 <-
+    VlnPlot(
+      SeuInt_sub[[i]],
+      features = c("EGFP-KASH"),
+      split.by = "Treat",
+      split.plot = T,
+      log = T
+    ) + labs(title = i)
+  print(VlnPlot1)
+}
+```
+
+### UMAP with the enrichment of EGFP+hSNCA+ cells:
+
+```{r EGFP+hSNCA+,  out.height= '110%'}
+for (i in c("1mo", "2mo")) {
+  SeuInt_PD <- subset(SeuInt_sub[[i]], subset = Treat == "PD")
+  # Add a text with the EGFP+hSNCA+ cells in PD dataset
+  global_contingency <- select(SeuInt_PD@meta.data, "seurat_clusters", "hSNCA", "EGFP") %>% do(data.frame(      
+    EGFP_SNCA = EGFP_SNCA(.),
+      EGFP = EGFP(.),
+      SNCA = SNCA(.),
+      Neith = Neith(.)
+    ))
+
+# Obtain the cluster contingency
+cluster_contingency <- select(SeuInt_PD@meta.data, "seurat_clusters", "hSNCA", "EGFP") %>% group_by(seurat_clusters) %>%
+  do(data.frame(      
+    EGFP_SNCA = EGFP_SNCA(.),
+      EGFP = EGFP(.),
+      SNCA = SNCA(.),
+      Neith = Neith(.)
+    ))
+
+# Obtain the "rest of cells" contingency for each cluster
+rest_contingency <- apply(as.matrix(cluster_contingency[,-1]),  1, 
+  function(x) -1*x + as.vector(global_contingency[1,])) %>%
+  do.call(what = rbind) %>% as.data.frame()
+rest_contingency$seurat_clusters <- cluster_contingency$seurat_clusters
+  
+  EGFP_hSNCA_contingency <- data.frame(
+  yes_cluster = cluster_contingency$EGFP_SNCA,
+  no_cluster = cluster_contingency$EGFP + cluster_contingency$Neith +
+    cluster_contingency$SNCA,
+  yes_rest_cluster = rest_contingency$EGFP_SNCA,
+  no_rest_cluster = rest_contingency$EGFP + rest_contingency$Neith +
+    rest_contingency$SNCA
+  )
+  
+  # Calculate the enrichment of hSNCA with EGFP for each cluster compared to rest of cells
+EGFP_hSNCA_FisherTest<-apply(as.matrix(EGFP_hSNCA_contingency), 1, fisher)
+colnames(EGFP_hSNCA_FisherTest) <- rest_contingency$seurat_clusters
+EGFP_hSNCA_FisherTest<- rbind(EGFP_hSNCA_FisherTest, "FDR" = p.adjust(EGFP_hSNCA_FisherTest["p_val",], "BH"))
+
+label2analyze <- c()
+  for (m in 1:length(clusters2analyze)){
+    if (m != 4){
+      label2analyze[m] <- paste0("Cluster ", clusters2analyze[m], " = ", round(EGFP_hSNCA_FisherTest["enrich", clusters2analyze[m]], 2), " (p-adj = ", format(EGFP_hSNCA_FisherTest["FDR", clusters2analyze[m]], digits=3), "); ")
+    } else {
+      label2analyze[m] <- paste0("Cluster ", clusters2analyze[m], " = ", round(EGFP_hSNCA_FisherTest["enrich", clusters2analyze[m]], 2), " (p-adj = ", format(EGFP_hSNCA_FisherTest["FDR", clusters2analyze[m]], digits=3), ");\n")
+    }
+  }
+text <-
+  ggplot(data.frame(x = 1, y = 1)) + geom_text(
+    size = 3,
+    label = paste0("EGFP+SNCA+ enrichment: ", paste(label2analyze, collapse = "")),
+    x = 0,
+    y = 0.5,
+    hjust = 0) + theme_void()  
+DefaultAssay(SeuInt_PD) <- "integrated"
+  UMAP_grid <- UMAPs_for_grid(SeuInt_PD, "Clusters")
+  UMAP5 <-
+    plot_grid(
+      ggdraw() + draw_label(i, fontface = 'bold', hjust = 0, size = 7),
+      plot_grid(UMAP_grid[["UMAP4_split"]], UMAP_grid[["UMAPa_edit"]], ncol = 2),
+      plot_grid(
+        NULL,
+        UMAP_grid[["UMAP4_legend"]],
+        ncol = 2,
+        rel_widths = c(0.1, 3)
+      ),
+      text,
+      ncol = 1,
+      nrow = 3,
+      rel_heights = c(0.6, 4, 0.2, 0.3), rel_widths = c(1,1,1,1.4))
+  print(UMAP5)
+  print(paste0("EGFP+SNCA+ enrichment: ", paste(label2analyze, collapse = "")))
+  rm(SeuInt_PD)
+}
+```
+
+
+
+```{r include=T}
+saveRDS(SeuInt, paste0("Outputs/", date, "_SeuInt_", numDS, "_fil_int_mayt", UMIs.p.cell_lowthreshold, "lowt", UMIs.p.cell_highthreshold,"_lowt", percent.rb_threshold, "rb_LC.rds"))
+gc()
+```

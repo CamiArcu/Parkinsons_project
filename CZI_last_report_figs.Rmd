@@ -1,0 +1,282 @@
+---
+title: "SAIB Poster Figures"
+author: "Camila Arcuschin; Ignacio Schor"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, echo = TRUE, warning = FALSE, dev = c('png', 'pdf'))
+knitr::opts_knit$set(root.dir = "/data_husihuilke/shared/SMB/carcu/Parkinsons_project/")
+```
+
+```{r importpckg, include=FALSE}
+library(Seurat)
+library(tidyverse)
+library(gridExtra)
+library(grid)
+library(ragg) # scaling plots
+library(reticulate)
+library(patchwork)
+library(cowplot)
+library(viridis)
+library(future) # parallel processing
+library(scater)
+library(ggbreak)
+RhpcBLASctl::blas_set_num_threads(3)
+plan(multisession, workers = 5)
+options(future.globals.maxSize = 4000 * 1024^2)
+#py_install("pandas")
+wd = "/data_husihuilke/shared/SMB/carcu/Parkinsons_project/"
+```
+
+
+```{r Functions}
+
+
+```
+
+
+Data from the LC:
+
+```{r}
+SeuInt_LC <- readRDS("Outputs/231129_SeuInt_3rd4th_fil_int_mayt1000lowt60000_lowtInfrb_24clusters.rds")
+predictions <- readRDS("Outputs/240222_DataTransfer_NELC_predictions_ctrl.rds")
+SeuInt_LC <- AddMetaData(SeuInt_LC, metadata = dplyr::select(predictions, predicted.id))
+equiv_table <- data.frame(seurat_cluster = SeuInt_LC$seurat_clusters, predicted.id = SeuInt_LC$predicted.id) %>% na.omit()
+equiv_table <- table(equiv_table$seurat_cluster, equiv_table$predicted.id) %>% as.matrix()
+totCells <- rowSums(equiv_table)
+equiv_table <- apply(equiv_table, 2, function(x) x/totCells)
+equiv_table_simplified <- apply(equiv_table, 1, function(x) paste(colnames(equiv_table)[x>0.45], collapse = "-"))
+equiv_table_simplified <- data.frame(seurat_clusters = names(equiv_table_simplified), CellType = equiv_table_simplified)
+equiv_table_simplified <- mutate(equiv_table_simplified, CellType = if_else(seurat_clusters == "3", "Astrocytes", CellType),
+                                 CellType = if_else(seurat_clusters == "5", "Oligodendrocytes", CellType),
+                                 CellType = if_else(seurat_clusters == "6", "Microglia", CellType),
+                                 CellType = if_else(seurat_clusters == "7", "Ependymal cells", CellType),
+                                 isGlia = if_else(seurat_clusters %in% c("3", "5", "6", "7"), T, F))
+equiv_table_simplified_count <- group_by(equiv_table_simplified, isGlia, CellType) %>% dplyr::count()
+equiv_table_simplified$CellType <- factor(equiv_table_simplified$CellType, levels = equiv_table_simplified_count$CellType)
+make_vector <- function(v){
+  sapply(v, function(x) 1:x) %>% unlist()
+}
+equiv_table_simplified <- arrange(equiv_table_simplified, isGlia, CellType) %>%  mutate(n_clust = make_vector(equiv_table_simplified_count$n))
+equiv_table_simplified <- mutate(equiv_table_simplified, CellType = if_else((duplicated(equiv_table_simplified$CellType) | duplicated(equiv_table_simplified$CellType, fromLast = T)), paste0(CellType, "_", n_clust), as.character(CellType)))
+equiv_table_simplified <- dplyr::select(equiv_table_simplified, seurat_clusters, CellType)
+equiv_table_simplified$CellType <- gsub("ergic", "", equiv_table_simplified$CellType)
+
+colFunc <- function(dark_color, n){
+  colfunc <- colorRampPalette(c("black", dark_color, "white"))
+  colfunc(n+4)[-c(1:3, (n+4))]
+}
+
+equiv_table_simplified$cols <- c(
+  colFunc("red", 5),
+  colFunc("#FF0046", 2),
+  colFunc("#B900FF",10),
+  "black", # "darkturquoise",
+  colFunc("#2EAA00", 4)
+)
+
+"#FFB900"
+
+Cols_vec_LC <- equiv_table_simplified$cols
+names(Cols_vec_LC) <- equiv_table_simplified$CellType
+
+SeuInt_LC@meta.data <- dplyr::select(SeuInt_LC@meta.data , - `INTE_nn`) %>% left_join(equiv_table_simplified)
+rownames(SeuInt_LC@meta.data) <- Cells(SeuInt_LC)
+
+saveRDS(SeuInt_LC, "Outputs/CZI_SeuInt_LC.rds")
+saveRDS(Cols_vec_LC, "Outputs/CZI_Cols_vec_LC.rds")
+```
+
+Data from the SN:
+
+```{r}
+SeuInt_SN <- readRDS("Outputs/231129_SeuInt_1st_fil_int_mayt1000lowt60000_lowtInfrb.rds")
+predictions <- readRDS("Outputs/240222_DataTransfer_DASN_predictions_ctrl.rds")
+
+SeuInt_SN <- AddMetaData(SeuInt_SN, metadata = dplyr::select(predictions, saund.prediction))
+equiv_table <- data.frame(seurat_cluster = SeuInt_SN$seurat_clusters, predicted.id = SeuInt_SN$saund.prediction) %>% na.omit()
+equiv_table <- table(equiv_table$seurat_cluster, equiv_table$predicted.id) %>% as.matrix()
+totCells <- rowSums(equiv_table)
+equiv_table <- apply(equiv_table, 2, function(x) x/totCells)
+equiv_table_simplified <- apply(equiv_table, 1, function(x) paste(colnames(equiv_table)[x>0.4], collapse = "-"))
+equiv_table_simplified["0"] <- "Neuron.Slc17a6.mix (Tcf4, Nkx6-1, Shox2)"
+equiv_table_simplified[c("10", "11")] <- "NotIdent"
+equiv_table_simplified <- data.frame(seurat_clusters = names(equiv_table_simplified), CellType = equiv_table_simplified)
+Broad <- str_split_fixed(equiv_table_simplified$CellType, "[.]", n = 3)[, 1:2]
+equiv_table_simplified <- mutate(equiv_table_simplified,
+                                 isGlia = if_else(seurat_clusters %in% c("3", "8", "5", "14", "15", "17"), T, F),
+                                 CellTypeBroad = paste0(Broad[,1], ".", Broad[,2])) %>% 
+  mutate(CellType = if_else((isGlia & CellType == "NotIdent"), paste0(CellType, "_glia"), CellType))
+equiv_table_simplified_count <- group_by(equiv_table_simplified, isGlia, CellType) %>% dplyr::count()
+equiv_table_simplified$CellType <- factor(equiv_table_simplified$CellType, levels = equiv_table_simplified_count$CellType)
+make_vector <- function(v){
+  sapply(v, function(x) 1:x) %>% unlist()
+}
+equiv_table_simplified <- arrange(equiv_table_simplified, isGlia, CellType) %>%  mutate(n_clust = make_vector(equiv_table_simplified_count$n))
+equiv_table_simplified <- mutate(equiv_table_simplified, CellType = if_else((duplicated(equiv_table_simplified$CellType) | duplicated(equiv_table_simplified$CellType, fromLast = T)), paste0(CellType, "_", n_clust), as.character(CellType)))
+equiv_table_simplified <- dplyr::select(equiv_table_simplified, seurat_clusters, CellType)
+
+equiv_table_simplified$cols <- c(
+  colFunc("red", 6),
+  colFunc("#B900FF",4),
+  "black", # "darkturquoise",
+  colFunc("#FFB900", 2),
+  colFunc("#2EAA00", 6)
+)
+
+
+Cols_vec_SN <- equiv_table_simplified$cols
+names(Cols_vec_SN) <- equiv_table_simplified$CellType
+
+SeuInt_SN@meta.data <- dplyr::select(SeuInt_SN@meta.data, -`integrated_nn`) %>% left_join(equiv_table_simplified)
+rownames(SeuInt_SN@meta.data) <- Cells(SeuInt_SN)
+
+saveRDS(SeuInt_SN, "Outputs/CZI_SeuInt_SN.rds")
+saveRDS(Cols_vec_SN, "Outputs/CZI_Cols_vec_SN.rds")
+```
+Figure 1
+```{r, fig.width=18, fig.height=12}
+## UMAP of LC and SN 
+DefaultAssay(SeuInt_LC) <- "INTE"
+
+a <- DimPlot(SeuInt_SN, group.by = "CellType", label = F, cols = Cols_vec_SN, order = F, cells = sample(Cells(SeuInt_SN))) + labs(title = "SN")  + theme_void() + guides(color = guide_legend(nrow = 10, override.aes = list(size=4), label.position = "left", label.hjust = 1)) + theme(title = element_text(size = 25), legend.position = c(0.5, -0.2), legend.text = element_text(size = 15, margin = margin(l = 10, unit = "pt"), hjust =1.1), plot.margin = unit(c(1,30,70,1), units = "mm"), legend.key.width = unit(0.55, "cm"), legend.key.height = unit(0.2, "cm"))
+
+Idents(SeuInt_LC) <- "CellType"
+b <- DimPlot(SeuInt_LC, group.by = "CellType", label = F, cols = Cols_vec_LC, order = F, cells = sample(Cells(SeuInt_LC))) + labs(title = "LC")  + theme_void() + guides(color = guide_legend(nrow = 10, override.aes = list(size=4), label.position = "left", label.hjust = 1)) + theme(title = element_text(size = 25), legend.position = c(0.5, -0.2), legend.text = element_text(size = 15), plot.margin = unit(c(1,30,70,1), units = "mm"), legend.key.width = unit(0.55, "cm"), legend.key.height = unit(0.2, "cm")) #legend.box.just = c("right", "bottom")
+#plot_grid(a, NULL, b, nrow = 1, rel_widths = c(1, 0.4, 1))
+plot_grid(a, b, ncol = 2)
+```
+
+Figure 1b
+```{r, fig.width=18, fig.height=12}
+## UMAP of LC and SN 
+DefaultAssay(SeuInt_LC) <- "INTE"
+
+a <- DimPlot(SeuInt_SN, group.by = "CellType", label = T, cols = Cols_vec_SN, order = F, cells = sample(Cells(SeuInt_SN))) + labs(title = "SN")  + theme_void() + theme(title = element_text(size = 25), legend.position = "none", legend.text = element_text(size = 15, margin = margin(l = 10, unit = "pt"), hjust =1.1), plot.margin = unit(c(1,30,70,1), units = "mm"), legend.key.width = unit(0.55, "cm"), legend.key.height = unit(0.2, "cm"))
+
+Idents(SeuInt_LC) <- "CellType"
+b <- DimPlot(SeuInt_LC, group.by = "CellType", label = T, cols = Cols_vec_LC, order = F, cells = sample(Cells(SeuInt_LC))) + labs(title = "LC")  + theme_void() + theme(title = element_text(size = 25), legend.position = "none", legend.text = element_text(size = 15), plot.margin = unit(c(1,30,70,1), units = "mm"), legend.key.width = unit(0.55, "cm"), legend.key.height = unit(0.2, "cm")) #legend.box.just = c("right", "bottom")
+#plot_grid(a, NULL, b, nrow = 1, rel_widths = c(1, 0.4, 1))
+plot_grid(a, b, ncol = 2)
+```
+
+Figure 1c
+```{r, fig.width=18, fig.height=12}
+## UMAP of LC and SN 
+DefaultAssay(SeuInt_LC) <- "INTE"
+
+Cols_vec_SN_homo <- c(
+  colFunc("#FF0046",10),
+  "black", # "darkturquoise",
+  colFunc("#FFB900", 2),
+  colFunc("#2EAA00", 6)
+)
+
+names(Cols_vec_SN_homo) <- names(Cols_vec_SN) 
+saveRDS(Cols_vec_SN_homo, "Outputs/CZI_Cols_vec_SN_homo.rds")
+
+a <- DimPlot(SeuInt_SN, group.by = "CellType", label = F, cols = Cols_vec_SN_homo, order = F, cells = sample(Cells(SeuInt_SN))) + labs(title = "SN")  + theme_void() + guides(color = guide_legend(nrow = 10, override.aes = list(size=4), label.position = "left", label.hjust = 1)) + theme(title = element_text(size = 25), legend.position = c(0.5, -0.2), legend.text = element_text(size = 15, margin = margin(l = 10, unit = "pt"), hjust =1.1), plot.margin = unit(c(1,30,70,1), units = "mm"), legend.key.width = unit(0.55, "cm"), legend.key.height = unit(0.2, "cm"))
+
+
+Cols_vec_LC_homo  <- c(
+  colFunc("#B900FF",17),
+  "black", # "darkturquoise",
+  colFunc("#2EAA00", 4)
+)
+
+names(Cols_vec_LC_homo) <- names(Cols_vec_LC)
+
+saveRDS(Cols_vec_LC_homo, "Outputs/CZI_Cols_vec_LC_homo.rds")
+Idents(SeuInt_LC) <- "CellType"
+b <- DimPlot(SeuInt_LC, group.by = "CellType", label = F, cols = Cols_vec_LC_homo, order = F, cells = sample(Cells(SeuInt_LC))) + labs(title = "LC")  + theme_void() + guides(color = guide_legend(nrow = 10, override.aes = list(size=4), label.position = "left", label.hjust = 1)) + theme(title = element_text(size = 25), legend.position = c(0.5, -0.2), legend.text = element_text(size = 15), plot.margin = unit(c(1,30,70,1), units = "mm"), legend.key.width = unit(0.55, "cm"), legend.key.height = unit(0.2, "cm")) #legend.box.just = c("right", "bottom")
+#plot_grid(a, NULL, b, nrow = 1, rel_widths = c(1, 0.4, 1))
+plot_grid(a, b, ncol = 2)
+```
+
+Figure 1d
+```{r, fig.width=18, fig.height=12}
+## UMAP of LC and SN 
+DefaultAssay(SeuInt_LC) <- "INTE"
+
+a <- DimPlot(SeuInt_SN, group.by = "CellType", label = T, cols = Cols_vec_SN_homo, order = F, cells = sample(Cells(SeuInt_SN))) + labs(title = "SN")  + theme_void() + theme(title = element_text(size = 25), legend.position = "none", legend.text = element_text(size = 15, margin = margin(l = 10, unit = "pt"), hjust =1.1), plot.margin = unit(c(1,30,70,1), units = "mm"), legend.key.width = unit(0.55, "cm"), legend.key.height = unit(0.2, "cm"))
+
+Idents(SeuInt_LC) <- "CellType"
+b <- DimPlot(SeuInt_LC, group.by = "CellType", label = T, cols = Cols_vec_LC_homo, order = F, cells = sample(Cells(SeuInt_LC))) + labs(title = "LC")  + theme_void() + theme(title = element_text(size = 25), legend.position = "none", legend.text = element_text(size = 15), plot.margin = unit(c(1,30,70,1), units = "mm"), legend.key.width = unit(0.55, "cm"), legend.key.height = unit(0.2, "cm")) #legend.box.just = c("right", "bottom")
+#plot_grid(a, NULL, b, nrow = 1, rel_widths = c(1, 0.4, 1))
+plot_grid(a, b, ncol = 2)
+```
+
+
+```{r, fig.width=12}
+
+enrichPlot <- function(x, title = NULL) {
+  p <- x %>% 
+    mutate(FDR = new.padj,
+           Description = Description.SN)
+  p <- p %>% 
+    ggplot() +
+    geom_point(aes(x = if_else(ds == "SN 1mo", -log10(FDR), log10(FDR)),
+                   y = fct_inorder(Description),
+                   color = Dir, alpha = -log10(FDR), size = Count)) +
+    labs(x = "-log10(FDR)", y = "", size = "gene count", title = title) +
+    theme_linedraw() +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    theme(panel.grid = element_blank()) +
+    scale_color_manual(values = c("up" = "red", "down" = "blue")) +
+    scale_x_continuous(labels = abs)
+  return(p)
+}
+
+enrichPlot_2 <- function(x, title = NULL) {
+  p <- x %>% 
+    mutate(FDR = new.padj,
+           Description = Description.SN)
+  p <- p %>% 
+    ggplot() +
+    geom_point(aes(x = -log10(FDR),
+                   y = fct_inorder(Description),
+                   color = Dir, alpha = -log10(FDR), size = Count)) +
+    labs(x = "-log10(FDR)", y = "", size = "gene count", title = title) +
+    theme_linedraw() +
+    theme(panel.grid = element_blank()) +
+    scale_color_manual(values = c("up" = "red", "down" = "blue"))
+  p <- p + facet_wrap(~ ds)
+  return(p)
+}
+
+`SN-1mo_up_notreg_LC-1mo` <- read_csv("Outputs/240716_GO_ORA_SN-1mo_up_notreg_LC-1mo_new_padj.csv") %>% filter(new.padj <= 0.05)
+`SN-1mo_down_notreg_LC-1mo` <- read_csv("Outputs/240716_GO_ORA_SN-1mo_down_notreg_LC-1mo_new_padj.csv") %>% filter(new.padj <= 0.05)
+
+`LC-2mo_up_notreg_SN-2mo` <- read_csv("Outputs/240716_GO_ORA_LC-2mo_up_notreg_SN-2mo_new_padj.csv") %>% filter(new.padj <= 0.05)
+`LC-2mo_down_notreg_SN-2mo` <- read_csv("Outputs/240716_GO_ORA_LC-2mo_down_notreg_SN-2mo_new_padj.csv") %>% filter(new.padj <= 0.05)
+
+SN_1mo_LC_2mo_up_exc <- inner_join(`SN-1mo_up_notreg_LC-1mo`, `LC-2mo_up_notreg_SN-2mo`, by = "ID", suffix = c(".SN", ".LC"))
+SN_1mo_LC_2mo_down_exc <- inner_join(`SN-1mo_down_notreg_LC-1mo`, `LC-2mo_down_notreg_SN-2mo` , by = "ID", suffix = c(".SN", ".LC"))
+# 
+# SN_1mo_up <- read_csv("Outputs/240716_GO_ORA_upreg_SN-1mo.csv") %>% filter(new.padj <= 0.05)
+# SN_1mo_down <- read_csv("Outputs/240716_GO_ORA_downreg_SN-1mo.csv") %>% filter(new.padj <= 0.05)
+# LC_2mo_up <- read_csv("Outputs/240716_GO_ORA_upreg_LC-2mo.csv") %>% filter(new.padj <= 0.05)
+# LC_2mo_down <- read_csv("Outputs/240716_GO_ORA_downreg_LC-2mo.csv") %>% filter(new.padj <= 0.05)
+# 
+# SN_1mo_LC_2mo_up <- inner_join(SN_1mo_up, LC_2mo_up, by = "ID", suffix = c(".SN", ".LC"))
+# SN_1mo_LC_2mo_down <- inner_join(SN_1mo_down, LC_2mo_down, by = "ID", suffix = c(".SN", ".LC"))
+
+SN_1mo_LC_2mo_up_exc <- mutate(SN_1mo_LC_2mo_up_exc, Dir = "up")
+SN_1mo_LC_2mo_down_exc <- mutate(SN_1mo_LC_2mo_down_exc, Dir = "down")
+SN_1mo_LC_2mo_exc <- rbind(SN_1mo_LC_2mo_up_exc, SN_1mo_LC_2mo_down_exc)
+SN_1mo_LC_2mo_exc <- pivot_longer(SN_1mo_LC_2mo_exc, cols = c(new.padj.SN, new.padj.LC), names_to = "ds", values_to = "new.padj")
+SN_1mo_LC_2mo_exc <- mutate(SN_1mo_LC_2mo_exc, Count = if_else(ds == "new.padj.SN", Count.SN, Count.LC))
+SN_1mo_LC_2mo_exc <- arrange(SN_1mo_LC_2mo_exc, Dir, desc(p.adjust.SN))
+SN_1mo_LC_2mo_exc <- mutate(SN_1mo_LC_2mo_exc, ds = if_else(ds == "new.padj.SN", "SN 1mo", "LC 2mo"),
+                            ds = factor(ds, levels = c("SN 1mo", "LC 2mo")))
+enrichPlot(SN_1mo_LC_2mo_exc, "GO enriched terms in SN 1mo and LC 2mo")
+enrichPlot_2(SN_1mo_LC_2mo_exc, "GO enriched terms in SN 1mo and LC 2mo")
+
+
+```
+
+
+
+

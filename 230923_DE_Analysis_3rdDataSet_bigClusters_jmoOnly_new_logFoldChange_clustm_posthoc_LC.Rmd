@@ -1,0 +1,236 @@
+---
+title: "Differential expression analysis Big Clusters"
+author: "Camila Arcuschin; Ignacio Schor"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    theme: cerulean
+    code_folding: hide
+out.width: '30%'
+out.heigh: '100%'
+fig.width: '100%'
+fig.height: '100%'
+dpi: 100
+editor_options: 
+  markdown: 
+    wrap: 72
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, echo = TRUE, warning = FALSE)
+knitr::opts_knit$set(root.dir = "/data_husihuilke/shared/SMB/carcu/Parkinsons_project/")
+```
+
+```{r, include=FALSE}
+library(Seurat)
+library(tidyverse)
+library(DESeq2)
+library(zinbwave)
+library(scran)
+library(RhpcBLASctl)
+library(ggrepel)
+library(BiocParallel)
+library(DT)
+register(MulticoreParam(10))
+```
+
+```{r, include=FALSE}
+#### Functions
+FCfun <- function (res_DE, fc, pad){
+  res_DE$diffexpressed <- "NO"
+  res_DE$diffexpressed[res_DE$log2FC > fc & res_DE$padj <= pad] <- "UP"
+  res_DE$diffexpressed[res_DE$log2FC < -fc & res_DE$padj <= pad] <- "DOWN"
+  res_DE$delabel <- NA
+  res_DE$delabel[res_DE$diffexpressed != "NO"] <- res_DE$Gene[res_DE$diffexpressed != "NO"]
+  res_DE$delabel[res_DE$Gene == "hSNCA-A53T"] <- "hSNCA-A53T"
+
+  Volcano<-ggplot(data=res_DE , aes(x=log2FC, y=-log10(padj), col=diffexpressed, label=delabel)) +
+    geom_point() +
+    theme_minimal() +
+    #xlim(min, max) +
+    geom_text_repel(max.overlaps = 100) +
+    scale_color_manual(values=c("DOWN" = "blue", "NO" = "black", "UP" = "red")) +
+    geom_vline(xintercept=c(-fc, fc), col="red") +
+    geom_hline(yintercept=-log10(pad), col="red")
+  Volcano
+}
+
+## Exclude unwellcomed genes from labeling, in the effect measure
+FCfun2 <- function (res_DE, fc, pad, notWellcome){
+  res_DE$diffexpressed <- "NO"
+  res_DE$diffexpressed[res_DE$log2FC > fc & res_DE$padj <= pad] <- "UP"
+  res_DE$diffexpressed[res_DE$log2FC < -fc & res_DE$padj <= pad] <- "DOWN"
+  res_DE$delabel <- NA
+  res_DE$delabel[res_DE$diffexpressed != "NO"] <- res_DE$Gene[res_DE$diffexpressed != "NO"]
+  res_DE$delabel[res_DE$Gene %in% notWellcome] <- NA
+  
+  Volcano<-ggplot(data=res_DE, aes(x=log2FC, y=-log10(padj), col=diffexpressed, label=delabel, alpha = !(Gene %in% notWellcome))) +
+    geom_point() +
+    theme_minimal() +
+    #xlim(min, max) +
+    geom_text_repel(max.overlaps = 100) + 
+    scale_color_manual(values=c("DOWN" = "blue", "NO" = "black", "UP" = "red")) +
+    geom_vline(xintercept=c(-fc, fc), col="red") +
+    geom_hline(yintercept=-log10(pad), col="red")
+  Volcano
+}
+```
+
+## Subseted data for post-hoc analysis of the jmo
+
+Differentially expressed genes (padj <= 0.05) from the analysis of the jmo, clust m, were used to check differences in the medias only across treatment (no interaction with DS evaluated).
+
+```{r}
+m = args[1]
+j = args[2]
+file = args[3]
+date = args[4]
+DESeq2_output <- read_csv(paste0("Outputs/", date, "_FCmat_official_full_log2FC_clust", m, "_", j, "_LC.csv"))
+nonDE_genes <- filter(DESeq2_output, padj > 0.05 | is.na(padj))
+nonDE_genes <- nonDE_genes$Gene
+```
+
+
+## DE Analysis
+
+[The model:]{.underline}
+
+For DE Analysis, we are doing an nbinomLRT. This means that we are doing
+a Likelihood Ratio Test of a full vs. a reduced model that both of them
+fit the data to a negative binomial model.
+
+In this context, the full model is:
+$$Counts  ⁓   Treat$$
+And the reduced model is: $$Counts  ⁓  1$$
+
+
+Same control of droupouts method was used as before (analysis from the 230626), also this counts for parameters used to estimate dispersion
+
+
+```{r CoreAnalysis, message=FALSE}
+
+  SeuObj <- readRDS(paste0("Outputs/", file))
+  DefaultAssay(SeuObj) <- "RNA"
+  SeuObj <- SetAssayData(SeuObj, assay.type = "RNA", slot = "counts", new.data = round(GetAssayData(SeuObj, slot = "counts"), 0))
+  #GetAssayData(object = SeuObj, slot = "counts")
+  SeuObj@meta.data <- select(SeuObj@meta.data, seurat_clusters, Treat, Age, orig.ident)
+  genenames <- rownames(SeuObj[["RNA"]]) 
+  SceLC <- subset(SeuObj, subset = seurat_clusters == m & Age == j)
+  SceLC <- DietSeurat(SceLC)
+  SceLC <- as.SingleCellExperiment(SceLC)
+  Average_Counts <- rowMeans(assays(SceLC)[["counts"]]) %>% log10()
+  ExpressingCells <- rowSums(assays(SceLC)[["counts"]]>0)
+  PropExpressingCells <- ExpressingCells/dim(SceLC)[2]
+    if (Average_Counts["hSNCA-A53T"] > -1 & PropExpressingCells["hSNCA-A53T"] > 0.1){
+    SceLC <- SceLC[Average_Counts > -1 & PropExpressingCells > 0.1, ]
+    rownames(SceLC) <- genenames[Average_Counts > -1 & PropExpressingCells > 0.1]
+  } else {
+    SceLC <- rbind(SceLC[Average_Counts > -1 & PropExpressingCells > 0.1, ], SceLC["hSNCA-A53T",])
+    rownames(SceLC) <- c(genenames[Average_Counts > -1 & PropExpressingCells > 0.1], "hSNCA-A53T")
+  }
+  rm(.Random.seed)
+  set.seed(0)
+  rm(SeuObj)
+  colData(SceLC)$Treat <- factor(x = colData(SceLC)$Treat)
+  colData(SceLC)$Age <- factor(x = colData(SceLC)$Age)
+  colData(SceLC)$orig.ident <- factor(x = colData(SceLC)$orig.ident)
+  blas_set_num_threads(1)
+  assay(SceLC) <- as.matrix(assay(SceLC))
+  SceLC <- scran::convertTo(SceLC, type = "DESeq2")
+  weights <- computeObservationalWeights(zinbFit(SceLC, X="~Treat", commondispersion = TRUE, epsilon=1e12), counts(SceLC))
+  assays(SceLC,  withDimnames = FALSE)[["weights"]] <- weights
+  SceLC <- scran::computeSumFactors(SceLC)#, clusters = clusters) # Compute sizeFactors for each cell avoiding biases because of dropouts (using deconvolution method by scran).
+  design(SceLC) <- formula(~Treat)
+  SceLC <- DESeq2::estimateDispersions(object = SceLC, fitType='local') # fitType "local" because the algorithm couldn't find parameters a and b to fit a function between mean and variance (and that is because is preatty plain the relationship)
+  SceLC <- nbinomLRT(SceLC, reduced= ~1, minmu = 1e-6)
+```
+
+#### log2FC of PD/Ctrl in jmo 3rd:
+
+```{r}
+eff_PD_jmo_3rd <- DESeq2::results(object = SceLC, contrast = list(c("Treat_PD_vs_Ctrl")), alpha = 0.05, independentFiltering=F, cooksCutoff=F ) %>% data.frame() %>% mutate(Gene = rownames(.))
+PD <- coef(SceLC)[,c("Intercept", "Treat_PD_vs_Ctrl" )] %>%   rowSums()
+  Ctrl <- coef(SceLC)[,c("Intercept")]
+  log2FC <- log2(2^(PD)/2^(Ctrl))
+  FC_df <- data.frame(log2FC, Gene = rownames(coef(SceLC)))
+  FC_df_jmo_3rd4th <- inner_join(eff_PD_jmo_3rd, FC_df)
+  GeneLab <- if_else(FC_df_jmo_3rd4th$Gene == "hSNCA-A53T", "hSNCA-A53T", "NA")
+  GeneLab[GeneLab == "NA"] <- NA
+  FC_df_jmo_3rd4th$GeneLab <- GeneLab
+```
+
+
+## Volcano plots
+
+#### Threshold in padj-value = 0.05:
+
+```{r}
+    FC_df_jmo_3rd4th %>% FCfun(0.5, 0.05) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 3rd4th DS")
+```
+
+How many of these are considered replicate specific genes?
+```{r}
+# Import replicate specific genes from corresponding contrast
+genes_replicate_specific <- readRDS(paste0("Outputs/", date, "_genes_replicate_specific_clust", m, "_", j, "_LC.rds"))
+
+# Erase these genes replicate specific from the volcano plot.
+FC_df_jmo_3rd4th %>% FCfun2(0.5, 0.05, genes_replicate_specific) + 
+labs(title = paste0("The effect of PD in the ", j), subtitle = "No replicate specific")
+```
+
+How many of these are ALSO not differentially expressed in the full model of first analysis?
+```{r}
+# Erase these genes replicate specific from the volcano plot.
+FC_df_jmo_3rd4th %>% FCfun2(0.5, 0.05, unique(c(genes_replicate_specific, nonDE_genes))) + 
+labs(title = paste0("The effect of PD in the ", j), subtitle = "No replicate specific neither nonDE on full model")
+```
+
+If I use a lower log2FC threshold:
+
+```{r}
+    FC_df_jmo_3rd4th  %>% FCfun(0.3, 0.05) + 
+    labs(title = paste0("The effect of PD in the ", j), subtitle = "In the 3rd4th DS")
+```
+
+Without replicate specific genes:
+```{r}
+# Erase these genes replicate specific from the volcano plot.
+FC_df_jmo_3rd4th %>% FCfun2(0.3, 0.05, genes_replicate_specific) + 
+labs(title = paste0("The effect of PD in the ", j), subtitle = "No replicate specific")
+```
+
+How many of these are ALSO not differentially expressed in the full model of first analysis?
+```{r}
+# Erase these genes replicate specific from the volcano plot.
+FC_df_jmo_3rd4th %>% FCfun2(0.3, 0.05, unique(c(genes_replicate_specific, nonDE_genes))) + 
+labs(title = paste0("The effect of PD in the ", j), subtitle = "No replicate specific neither nonDE on full model")
+```
+
+```{r}
+# Saving these table
+write_csv(filter(FC_df_jmo_3rd4th), paste0("Outputs/", date, "_FCmat_posthoc_nofilter_log2FC_clust", m, "_", j, "_LC.csv"))
+write_csv(filter(FC_df_jmo_3rd4th, !(Gene %in% nonDE_genes)), paste0("Outputs/", date, "_FCmat_posthoc_nonDEfilter_log2FC_clust", m, "_", j, "_LC.csv"))
+write_csv(filter(FC_df_jmo_3rd4th, !(Gene %in% genes_replicate_specific)), paste0("Outputs/", date, "_FCmat_replicatefilter_official_log2FC_clust", m, "_", j, "_LC.csv"))
+write_csv(filter(FC_df_jmo_3rd4th, !(Gene %in% c(genes_replicate_specific, nonDE_genes))), paste0("Outputs/", date, "_FCmat_nonDEreplicatefilter_log2FC_clust", m, "_", j, "_LC.csv"))
+```
+
+Different types of not considered genes
+
+```{r}
+DESeq2_output_sig <- filter(DESeq2_output, padj <= 0.05)
+comparison <- inner_join(FC_df_jmo_3rd4th, DESeq2_output_sig, by = "Gene")
+filter(comparison, padj.x > 0.05, Gene %in% genes_replicate_specific)$Gene # 7, entre ellos hSNCA-A53T
+comparison2 <- filter(comparison, !(Gene %in% genes_replicate_specific))
+filter(comparison2, padj.x <= 0.05)$Gene #39
+filter(comparison2, padj.x > 0.05)$Gene #12 
+filter(comparison2, abs(log2FC3rd) < 0.3, abs(log2FC) > 0.3)$Gene # 9 
+filter(comparison2, abs(log2FC4th) < 0.3, abs(log2FC) > 0.3)$Gene # 7 distintos
+filter(comparison2, log2FC3rd < -0.3, log2FC > 0.3)$Gene # 0 
+filter(comparison2, log2FC3rd > 0.3, log2FC < -0.3)$Gene # 3
+filter(comparison2, log2FC4th < -0.3, log2FC > 0.3)$Gene # 0 
+filter(comparison2, log2FC4th > 0.3, log2FC < -0.3)$Gene # 1
+```
+
